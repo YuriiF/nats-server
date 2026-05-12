@@ -2932,6 +2932,7 @@ retry:
 		}
 		s.Debugf("JetStream cluster already has raft group %q assigned", name)
 		rg.node = node
+		node.UpdateAllowedPeers(peerSet)
 		return node, nil
 	}
 
@@ -5486,6 +5487,12 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			js.mu.Lock()
 			rg.node = nil
 			js.mu.Unlock()
+		} else {
+			js.createRaftGroup(acc.GetName(), rg, desired, recovering, storage, pprofLabels{
+				"type":    "stream",
+				"account": mset.accName(),
+				"stream":  mset.name(),
+			})
 		}
 		// Set the new stream assignment.
 		mset.setStreamAssignment(sa)
@@ -8931,6 +8938,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	if err := meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
 		return
 	}
+	//fmt.Printf("Stream update placement: %v (%s)\n", sa.Config.Placement, sa.Group.Name)
 	cc.trackInflightStreamProposal(acc.Name, sa, false)
 
 	// Process any staged consumers.
