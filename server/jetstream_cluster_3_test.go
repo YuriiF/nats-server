@@ -1766,6 +1766,104 @@ func TestJetStreamClusterGhostEphemeralsAfterRestart(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterConsumerUpdateRaceWithDeleteNotActiveDefer(t *testing.T) {
+	// Long enough that the retry loop keeps sleeping while we restart the meta
+	// leader and update the consumer, then wakes up to re-check the assignment.
+	consumerNotActiveStartInterval = 5 * time.Second
+	consumerNotActiveMaxInterval = 5 * time.Second
+	t.Cleanup(func() {
+		consumerNotActiveStartInterval = defaultConsumerNotActiveStartInterval
+		consumerNotActiveMaxInterval = defaultConsumerNotActiveMaxInterval
+	})
+
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// R1 so the consumer lives on a single peer.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          1,
+		InactiveThreshold: 1500 * time.Millisecond,
+	})
+	require_NoError(t, err)
+
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	consumerLeader := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, consumerLeader)
+
+	// Shut down both non-consumer peers so meta loses quorum entirely; just
+	// stopping the meta leader is not enough since the remaining two would
+	// elect a new one within ~1s and the proposal would land normally.
+	var otherPeers []*Server
+	for _, s := range c.servers {
+		if s != consumerLeader {
+			otherPeers = append(otherPeers, s)
+		}
+	}
+	require_Equal(t, len(otherPeers), 2)
+	otherPeers[0].Shutdown()
+	otherPeers[1].Shutdown()
+
+	// Let InactiveThreshold elapse so deleteNotActive fires; its first
+	// ForwardProposal is dropped (no meta leader) and the retry loop sleeps.
+	time.Sleep(3 * time.Second)
+
+	// Restart both peers so the cluster elects a new meta leader.
+	c.restartServer(otherPeers[0])
+	c.restartServer(otherPeers[1])
+	c.waitOnLeader()
+
+	// Reconnect, the original connection might have been to a stopped peer.
+	nc.Close()
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Update the consumer so the new consumerAssignment differs from the one
+	// the inflight deleteNotActive captured.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          1,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	// Confirm the update actually landed and is visible to the API.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+		if err != nil {
+			return fmt.Errorf("consumer info failed: %w", err)
+		}
+		if ci.Config.InactiveThreshold != time.Hour {
+			return fmt.Errorf("expected updated InactiveThreshold=1h, got %v", ci.Config.InactiveThreshold)
+		}
+		return nil
+	})
+
+	// During the retry-tick window (between +cnaStart and +2*cnaStart) the loop
+	// must wake up, see the assignment changed, and return without deleting
+	// locally. Continuously verify the consumer remains until we're past the
+	// latest possible tick fire so a regression fails fast.
+	deadline := time.Now().Add(2*consumerNotActiveStartInterval + time.Second)
+	for time.Now().Before(deadline) {
+		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_Equal(t, ci.Config.InactiveThreshold, time.Hour)
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 	// R3 scenario where there is a redundant node in each unique cloud so removing a peer should result in
 	// an immediate replacement also preserving cloud uniqueness.
