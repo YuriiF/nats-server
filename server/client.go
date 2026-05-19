@@ -2695,6 +2695,12 @@ func (c *client) processPing() {
 		srv.mu.Lock()
 		info := srv.copyInfo()
 		c.mu.Lock()
+		// Keep the in-process tls_required override from the initial INFO,
+		// otherwise this async INFO would flip it back to true.
+		if c.iproc && info.TLSRequired && !c.flags.isSet(didTLSFirst) {
+			info.TLSRequired = false
+			info.TLSAvailable = true
+		}
 		info.RemoteAccount = c.acc.Name
 		info.IsSystemAccount = c.acc == srv.SystemAccount()
 		info.ConnectInfo = true
