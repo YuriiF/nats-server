@@ -727,6 +727,14 @@ func (js *jetStream) isStreamHealthy(acc *Account, sa *streamAssignment) error {
 		js.mu.RUnlock()
 		return errors.New("stream assignment or group missing")
 	}
+	// Surface any persisted assignment-level error (e.g. failed create on this
+	// peer due to account limits) so the health check reflects the broken state
+	// instead of falling through to runtime-only checks.
+	if sa.err != nil {
+		err := sa.err
+		js.mu.RUnlock()
+		return fmt.Errorf("stream assignment error: %w", err)
+	}
 	streamName := sa.Config.Name
 	node := sa.Group.node
 	js.mu.RUnlock()
@@ -790,6 +798,14 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 	if ca == nil || ca.Group == nil {
 		js.mu.RUnlock()
 		return errors.New("consumer assignment or group missing")
+	}
+	// Surface any persisted assignment-level error (e.g. failed create on this
+	// peer) so the health check reflects the broken state instead of falling
+	// through to runtime-only checks.
+	if ca.err != nil {
+		err := ca.err
+		js.mu.RUnlock()
+		return fmt.Errorf("consumer assignment error: %w", err)
 	}
 	created := ca.Created
 	node := ca.Group.node
@@ -4930,6 +4946,7 @@ func (s *Server) removeStream(mset *stream, nsa *streamAssignment) {
 	if js, _ := s.getJetStreamCluster(); js != nil {
 		js.mu.Lock()
 		nsa.Group.node = nil
+		nsa.err = nil
 		isShuttingDown = js.shuttingDown
 		js.mu.Unlock()
 	}
