@@ -2795,23 +2795,23 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 	// With desired state tracking a move is in progress when the stream has a desired
 	// placement configured. Canceling simply drops it and keeps the current peer set,
 	// proposing the change at the meta layer and tracking it like any other update.
-	if sa.DesiredPlacement != nil {
+	if sa.Group != nil && sa.Group.Desired != nil {
 		restorePeers := copyStrings(sa.Group.Peers)
 		nsa := sa.copyGroup()
 		nsa.Reply = _EMPTY_
-		nsa.DesiredPlacement = nil
+		nsa.Group.Desired = nil
 		proposeErr := cc.meta.Propose(encodeUpdateStreamAssignment(nsa))
 		if proposeErr == nil {
 			cc.trackInflightStreamProposal(accName, nsa, false)
 			// Cancel any consumer moves that were started as part of this stream move too,
 			// otherwise they would keep migrating to the new peer set.
 			for _, ca := range sa.consumers {
-				if ca.DesiredPlacement == nil {
+				if ca.Group == nil || ca.Group.Desired == nil {
 					continue
 				}
 				nca := ca.copyGroup()
 				nca.Reply = _EMPTY_
-				nca.DesiredPlacement = nil
+				nca.Group.Desired = nil
 				if err := cc.meta.Propose(encodeAddConsumerAssignment(nca)); err == nil {
 					cc.trackInflightConsumerProposal(accName, streamName, nca, false)
 				}
