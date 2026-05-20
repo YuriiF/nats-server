@@ -656,6 +656,126 @@ func TestNRGUnsuccessfulVoteRequestCampaignEarly(t *testing.T) {
 	require_Equal(t, n.etlr, time.Time{})
 }
 
+func TestNRGUpdateAllowedPeers(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	const (
+		peerA = "peer-A"
+		peerB = "peer-B"
+		peerC = "peer-C"
+	)
+
+	// reset puts the node into a known peers/removed state before a subtest.
+	// The node is inert (its run loop is never started), so we can manipulate
+	// and inspect these maps directly.
+	reset := func(peers map[string]*lps, removed map[string]time.Time) {
+		n.Lock()
+		n.peers = peers
+		n.removed = removed
+		n.Unlock()
+	}
+
+	t.Run("UnknownPeerMarkedRemovedWithZeroTimestamp", func(t *testing.T) {
+		reset(map[string]*lps{}, nil)
+		n.UpdateAllowedPeers([]string{peerA})
+
+		// The peer is not made a member...
+		_, isPeer := n.peers[peerA]
+		require_False(t, isPeer)
+		// ...but it is recorded as removed with a zero timestamp, which means it
+		// is treated as already past peerRemoveTimeout and may rejoin immediately.
+		ts, isRemoved := n.removed[peerA]
+		require_True(t, isRemoved)
+		require_True(t, ts.IsZero())
+		require_True(t, time.Since(ts) >= peerRemoveTimeout)
+	})
+
+	t.Run("LazilyAllocatesRemovedMap", func(t *testing.T) {
+		// Starting from a nil removed map, an unknown peer triggers allocation.
+		reset(map[string]*lps{}, nil)
+		require_True(t, n.removed == nil)
+		n.UpdateAllowedPeers([]string{peerA})
+		require_False(t, n.removed == nil)
+	})
+
+	t.Run("KnownMemberLeftUntouched", func(t *testing.T) {
+		reset(map[string]*lps{peerA: {kp: true}}, nil)
+		n.UpdateAllowedPeers([]string{peerA})
+
+		// Existing member is unchanged and is not added to the removed set; since
+		// nothing else needed it, the removed map is never even allocated.
+		_, isPeer := n.peers[peerA]
+		require_True(t, isPeer)
+		_, isRemoved := n.removed[peerA]
+		require_False(t, isRemoved)
+		require_True(t, n.removed == nil)
+	})
+
+	t.Run("ExistingRemovalTimestampResetToZero", func(t *testing.T) {
+		// A peer that was actively removed carries a recent timestamp, which
+		// would normally block it from rejoining until peerRemoveTimeout passes.
+		removedAt := time.Now()
+		reset(map[string]*lps{}, map[string]time.Time{peerA: removedAt})
+		n.UpdateAllowedPeers([]string{peerA})
+
+		// Allowing the peer clears that cooldown by resetting it to zero.
+		ts, isRemoved := n.removed[peerA]
+		require_True(t, isRemoved)
+		require_True(t, ts.IsZero())
+		require_True(t, time.Since(ts) >= peerRemoveTimeout)
+	})
+
+	t.Run("EmptyInputIsNoOp", func(t *testing.T) {
+		reset(map[string]*lps{peerA: {kp: true}}, nil)
+		n.UpdateAllowedPeers(nil)
+		n.UpdateAllowedPeers([]string{})
+
+		require_Len(t, len(n.peers), 1)
+		require_True(t, n.removed == nil)
+	})
+
+	t.Run("MixedKnownAndUnknownPeers", func(t *testing.T) {
+		// peerA is a current member; peerB and peerC are not.
+		reset(map[string]*lps{peerA: {kp: true}}, nil)
+		n.UpdateAllowedPeers([]string{peerA, peerB, peerC})
+
+		// The member is left out of the removed set...
+		_, isRemoved := n.removed[peerA]
+		require_False(t, isRemoved)
+		// ...while the non-members are each marked removed with a zero timestamp.
+		for _, p := range []string{peerB, peerC} {
+			ts, isRemoved := n.removed[p]
+			require_True(t, isRemoved)
+			require_True(t, ts.IsZero())
+		}
+		require_Len(t, len(n.removed), 2)
+	})
+
+	t.Run("RemovePeerPreservesAllowedZeroTimestamp", func(t *testing.T) {
+		// removePeer normally stamps the removal time, imposing the rejoin
+		// cooldown. Sanity check that baseline behavior first.
+		reset(map[string]*lps{peerA: {kp: true}, peerB: {kp: true}}, nil)
+		n.Lock()
+		n.removePeer(peerB)
+		baseline := n.removed[peerB]
+		n.Unlock()
+		require_False(t, baseline.IsZero())
+		require_True(t, time.Since(baseline) < peerRemoveTimeout)
+
+		// But once a peer has been marked as allowed (zero timestamp), a
+		// subsequent removePeer must not overwrite it with the current time, so
+		// the peer remains eligible to rejoin without waiting out the cooldown.
+		reset(map[string]*lps{}, nil)
+		n.UpdateAllowedPeers([]string{peerB})
+		n.Lock()
+		n.removePeer(peerB)
+		preserved := n.removed[peerB]
+		n.Unlock()
+		require_True(t, preserved.IsZero())
+	})
+}
+
 func TestNRGInvalidTAVDoesntPanic(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
