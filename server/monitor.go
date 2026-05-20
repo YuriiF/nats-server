@@ -3133,7 +3133,7 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 
 	if js := s.getJetStream(); js != nil && optStreams {
 		for _, stream := range streams {
-			ci := js.clusterInfoOfStreamAssignment(stream.streamAssignment())
+			ci := js.clusterInfoOfGroup(stream.raftGroup())
 			var cfg *StreamConfig
 			if optCfg {
 				c := stream.config()

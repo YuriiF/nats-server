@@ -1955,7 +1955,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, a *Account, s
 				// We know we are a member here, if this group is new and we are preferred allow us to answer.
 				// Also, we have seen cases where rg.node is nil at this point,
 				// so check explicitly and bail if that is the case.
-				bail = rg.Preferred != ourID || (rg.node != nil && time.Since(rg.node.Created()) > lostQuorumIntervalDefault) || sa.DesiredPlacement != nil
+				bail = rg.Preferred != ourID || (rg.node != nil && time.Since(rg.node.Created()) > lostQuorumIntervalDefault)
 			}
 			js.mu.RUnlock()
 			if bail {
@@ -2021,7 +2021,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, a *Account, s
 		State:      mset.stateWithDetail(details),
 		Config:     *setDynamicStreamMetadata(&config),
 		Domain:     s.getOpts().JetStreamDomain,
-		Cluster:    js.clusterInfoOfStreamAssignment(mset.streamAssignment()),
+		Cluster:    js.clusterInfoOfGroup(mset.raftGroup()),
 		Mirror:     mset.mirrorInfo(),
 		Sources:    mset.sourcesInfo(),
 		Alternates: js.streamAlternates(ci, config.Name),
@@ -5087,7 +5087,7 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, _ *Account,
 			bail := !node.Leaderless() || node.HadPreviousLeader() || rg == nil
 			if !bail {
 				js.mu.RLock()
-				bail = rg.Preferred != ourID || (rg.node != nil && time.Since(rg.node.Created()) > lostQuorumIntervalDefault) || ca.DesiredPlacement != nil
+				bail = rg.Preferred != ourID || (rg.node != nil && time.Since(rg.node.Created()) > lostQuorumIntervalDefault)
 				js.mu.RUnlock()
 			}
 			if bail {

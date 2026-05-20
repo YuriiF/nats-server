@@ -3545,7 +3545,7 @@ func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
 
 	// Do cluster.
 	if ca != nil {
-		info.Cluster = js.clusterInfoOfConsumerAssignment(ca)
+		info.Cluster = js.clusterInfoOfGroup(ca.Group)
 	}
 
 	// If we have a reply subject send the response here.

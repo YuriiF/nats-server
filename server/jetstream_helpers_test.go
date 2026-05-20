@@ -1448,7 +1448,7 @@ func (c *cluster) waitOnConsumerLeader(account, stream, consumer string) {
 		js := leader.getJetStream()
 		js.mu.RLock()
 		ca := js.consumerAssignment(account, stream, consumer)
-		wait := ca == nil || ca.DesiredPlacement != nil
+		wait := ca == nil || (ca.Group != nil && ca.Group.Desired != nil)
 		js.mu.RUnlock()
 		if wait {
 			time.Sleep(100 * time.Millisecond)
@@ -1499,7 +1499,7 @@ func (c *cluster) waitOnStreamLeader(account, stream string) {
 		js := leader.getJetStream()
 		js.mu.RLock()
 		sa := js.streamAssignment(account, stream)
-		wait := sa == nil || sa.DesiredPlacement != nil
+		wait := sa == nil || (sa.Group != nil && sa.Group.Desired != nil)
 		js.mu.RUnlock()
 		if wait {
 			time.Sleep(100 * time.Millisecond)

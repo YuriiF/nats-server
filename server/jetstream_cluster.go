@@ -164,12 +164,19 @@ type raftGroup struct {
 	Cluster   string      `json:"cluster,omitempty"`
 	Preferred string      `json:"preferred,omitempty"`
 	ScaleUp   bool        `json:"scale_up,omitempty"`
+	// Desired holds the target placement while this group is being moved or
+	// scaled; it is nil when the group is stable. It travels with the group so
+	// that membership/leader/cluster-info logic can reason over current+desired
+	// peers without the caller needing to know whether the group belongs to a
+	// stream or a consumer. Invariant: Desired.Group is a leaf, i.e.
+	// Desired.Group.Desired is always nil (placement is only ever one level deep).
+	Desired *desiredGroupPlacement `json:"desired,omitempty"`
 	// Internal
 	node RaftNode
 }
 
 // desiredGroupPlacement specifies the desired peer set.
-// A streamAssignment or consumerAssignment can be scaled or moved safely based on this desired state.
+// A stream or consumer raftGroup can be scaled or moved safely based on this desired state.
 type desiredGroupPlacement struct {
 	ID        string     `json:"id"`
 	Placement *Placement `json:"placement,omitempty"`
@@ -178,16 +185,15 @@ type desiredGroupPlacement struct {
 
 // streamAssignment is what the meta controller uses to assign streams to peers.
 type streamAssignment struct {
-	Client           *ClientInfo            `json:"client,omitempty"`
-	Created          time.Time              `json:"created"`
-	ConfigJSON       json.RawMessage        `json:"stream"`
-	Config           *StreamConfig          `json:"-"`
-	Group            *raftGroup             `json:"group"`
-	Sync             string                 `json:"sync"`
-	Subject          string                 `json:"subject,omitempty"`
-	Reply            string                 `json:"reply,omitempty"`
-	Restore          *StreamState           `json:"restore_state,omitempty"`
-	DesiredPlacement *desiredGroupPlacement `json:"desired_placement,omitempty"`
+	Client     *ClientInfo     `json:"client,omitempty"`
+	Created    time.Time       `json:"created"`
+	ConfigJSON json.RawMessage `json:"stream"`
+	Config     *StreamConfig   `json:"-"`
+	Group      *raftGroup      `json:"group"`
+	Sync       string          `json:"sync"`
+	Subject    string          `json:"subject,omitempty"`
+	Reply      string          `json:"reply,omitempty"`
+	Restore    *StreamState    `json:"restore_state,omitempty"`
 	// Internal
 	consumers   map[string]*consumerAssignment
 	responded   atomic.Bool // copied via clone() to satisfy go vet's noCopy check
@@ -217,22 +223,21 @@ func (sa *streamAssignment) clearResponded() {
 // responded via markResponded/clearResponded without holding js.mu.
 func (sa *streamAssignment) clone() *streamAssignment {
 	csa := &streamAssignment{
-		Client:           sa.Client,
-		Created:          sa.Created,
-		ConfigJSON:       sa.ConfigJSON,
-		Config:           sa.Config,
-		Group:            sa.Group,
-		Sync:             sa.Sync,
-		Subject:          sa.Subject,
-		Reply:            sa.Reply,
-		Restore:          sa.Restore,
-		DesiredPlacement: sa.DesiredPlacement,
-		consumers:        sa.consumers,
-		recovering:       sa.recovering,
-		reassigning:      sa.reassigning,
-		resetting:        sa.resetting,
-		err:              sa.err,
-		unsupported:      sa.unsupported,
+		Client:      sa.Client,
+		Created:     sa.Created,
+		ConfigJSON:  sa.ConfigJSON,
+		Config:      sa.Config,
+		Group:       sa.Group,
+		Sync:        sa.Sync,
+		Subject:     sa.Subject,
+		Reply:       sa.Reply,
+		Restore:     sa.Restore,
+		consumers:   sa.consumers,
+		recovering:  sa.recovering,
+		reassigning: sa.reassigning,
+		resetting:   sa.resetting,
+		err:         sa.err,
+		unsupported: sa.unsupported,
 	}
 	csa.responded.Store(sa.responded.Load())
 	return csa
@@ -303,17 +308,16 @@ func (usa *unsupportedStreamAssignment) closeInfoSub(s *Server) {
 
 // consumerAssignment is what the meta controller uses to assign consumers to streams.
 type consumerAssignment struct {
-	Client           *ClientInfo            `json:"client,omitempty"`
-	Created          time.Time              `json:"created"`
-	Name             string                 `json:"name"`
-	Stream           string                 `json:"stream"`
-	ConfigJSON       json.RawMessage        `json:"consumer"`
-	Config           *ConsumerConfig        `json:"-"`
-	Group            *raftGroup             `json:"group"`
-	Subject          string                 `json:"subject,omitempty"`
-	Reply            string                 `json:"reply,omitempty"`
-	State            *ConsumerState         `json:"state,omitempty"`
-	DesiredPlacement *desiredGroupPlacement `json:"desired_placement,omitempty"`
+	Client     *ClientInfo     `json:"client,omitempty"`
+	Created    time.Time       `json:"created"`
+	Name       string          `json:"name"`
+	Stream     string          `json:"stream"`
+	ConfigJSON json.RawMessage `json:"consumer"`
+	Config     *ConsumerConfig `json:"-"`
+	Group      *raftGroup      `json:"group"`
+	Subject    string          `json:"subject,omitempty"`
+	Reply      string          `json:"reply,omitempty"`
+	State      *ConsumerState  `json:"state,omitempty"`
 	// Internal
 	responded   atomic.Bool // copied via clone() to satisfy go vet's noCopy check
 	recovering  bool
@@ -355,20 +359,19 @@ func (ca *consumerAssignment) sameIdentity(nca *consumerAssignment) bool {
 // responded via markResponded/clearResponded without holding js.mu.
 func (ca *consumerAssignment) clone() *consumerAssignment {
 	cca := &consumerAssignment{
-		Client:           ca.Client,
-		Created:          ca.Created,
-		Name:             ca.Name,
-		Stream:           ca.Stream,
-		ConfigJSON:       ca.ConfigJSON,
-		Config:           ca.Config,
-		Group:            ca.Group,
-		Subject:          ca.Subject,
-		Reply:            ca.Reply,
-		State:            ca.State,
-		DesiredPlacement: ca.DesiredPlacement,
-		recovering:       ca.recovering,
-		err:              ca.err,
-		unsupported:      ca.unsupported,
+		Client:      ca.Client,
+		Created:     ca.Created,
+		Name:        ca.Name,
+		Stream:      ca.Stream,
+		ConfigJSON:  ca.ConfigJSON,
+		Config:      ca.Config,
+		Group:       ca.Group,
+		Subject:     ca.Subject,
+		Reply:       ca.Reply,
+		State:       ca.State,
+		recovering:  ca.recovering,
+		err:         ca.err,
+		unsupported: ca.unsupported,
 	}
 	cca.responded.Store(ca.responded.Load())
 	return cca
@@ -439,13 +442,12 @@ func (uca *unsupportedConsumerAssignment) closeInfoSub(s *Server) {
 }
 
 type writeableConsumerAssignment struct {
-	Client           *ClientInfo            `json:"client,omitempty"`
-	Created          time.Time              `json:"created"`
-	Name             string                 `json:"name"`
-	Stream           string                 `json:"stream"`
-	ConfigJSON       json.RawMessage        `json:"consumer"`
-	Group            *raftGroup             `json:"group"`
-	DesiredPlacement *desiredGroupPlacement `json:"desired_placement,omitempty"`
+	Client     *ClientInfo     `json:"client,omitempty"`
+	Created    time.Time       `json:"created"`
+	Name       string          `json:"name"`
+	Stream     string          `json:"stream"`
+	ConfigJSON json.RawMessage `json:"consumer"`
+	Group      *raftGroup      `json:"group"`
 }
 
 // streamPurge is what the stream leader will replicate when purging a stream.
@@ -1253,13 +1255,7 @@ func (cc *jetStreamCluster) isStreamAssigned(a *Account, stream string) bool {
 	if sa == nil {
 		return false
 	}
-	ourID := cc.meta.ID()
-	if sa.DesiredPlacement != nil {
-		if sa.DesiredPlacement.Group.isMember(ourID) {
-			return true
-		}
-	}
-	return sa.Group.isMember(ourID)
+	return sa.Group.isMemberOrDesired(cc.meta.ID())
 }
 
 // Read lock should be held.
@@ -1285,7 +1281,7 @@ func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	}
 	// Check if we are the leader of this raftGroup assigned to the stream.
 	ourID := cc.meta.ID()
-	peerSet := rg.combinePeersWithDesired(sa.DesiredPlacement)
+	peerSet := rg.combinePeersWithDesired()
 	for _, peer := range peerSet {
 		if peer == ourID {
 			if len(peerSet) == 1 || (rg.node != nil && rg.node.Leader()) {
@@ -1323,7 +1319,7 @@ func (cc *jetStreamCluster) isConsumerLeader(account, stream, consumer string) b
 		return false
 	}
 	ourID := cc.meta.ID()
-	peerSet := rg.combinePeersWithDesired(ca.DesiredPlacement)
+	peerSet := rg.combinePeersWithDesired()
 	for _, peer := range peerSet {
 		if peer == ourID {
 			if len(peerSet) == 1 || (rg.node != nil && rg.node.Leader()) {
@@ -2017,13 +2013,12 @@ func (js *jetStream) checkClusterSize() {
 
 // Represents our stable meta state that we can write out.
 type writeableStreamAssignment struct {
-	Client           *ClientInfo            `json:"client,omitempty"`
-	Created          time.Time              `json:"created"`
-	ConfigJSON       json.RawMessage        `json:"stream"`
-	Group            *raftGroup             `json:"group"`
-	Sync             string                 `json:"sync"`
-	DesiredPlacement *desiredGroupPlacement `json:"desired_placement,omitempty"`
-	Consumers        []*writeableConsumerAssignment
+	Client     *ClientInfo     `json:"client,omitempty"`
+	Created    time.Time       `json:"created"`
+	ConfigJSON json.RawMessage `json:"stream"`
+	Group      *raftGroup      `json:"group"`
+	Sync       string          `json:"sync"`
+	Consumers  []*writeableConsumerAssignment
 }
 
 func (js *jetStream) clusterStreamConfig(accName, streamName string) (StreamConfig, bool) {
@@ -2197,12 +2192,11 @@ func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*stre
 			streams[wsa.Client.serviceAccount()] = as
 		}
 		sa := &streamAssignment{
-			Client:           wsa.Client,
-			Created:          wsa.Created,
-			ConfigJSON:       wsa.ConfigJSON,
-			Group:            wsa.Group,
-			Sync:             wsa.Sync,
-			DesiredPlacement: wsa.DesiredPlacement,
+			Client:     wsa.Client,
+			Created:    wsa.Created,
+			ConfigJSON: wsa.ConfigJSON,
+			Group:      wsa.Group,
+			Sync:       wsa.Sync,
 		}
 		if err := decodeStreamAssignmentConfig(js.srv, sa); err != nil {
 			return nil, err
@@ -2214,13 +2208,12 @@ func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*stre
 					wca.Stream = sa.Config.Name // Rehydrate from the stream name.
 				}
 				ca := &consumerAssignment{
-					Client:           wca.Client,
-					Created:          wca.Created,
-					Name:             wca.Name,
-					Stream:           wca.Stream,
-					ConfigJSON:       wca.ConfigJSON,
-					Group:            wca.Group,
-					DesiredPlacement: wca.DesiredPlacement,
+					Client:     wca.Client,
+					Created:    wca.Created,
+					Name:       wca.Name,
+					Stream:     wca.Stream,
+					ConfigJSON: wca.ConfigJSON,
+					Group:      wca.Group,
 				}
 				if err := decodeConsumerAssignmentConfig(ca); err != nil {
 					return nil, err
@@ -2246,23 +2239,21 @@ func (js *jetStream) encodeMetaSnapshot(streams map[string]map[string]*streamAss
 	for _, asa := range streams {
 		for _, sa := range asa {
 			wsa := writeableStreamAssignment{
-				Client:           sa.Client.forAssignmentSnap(),
-				Created:          sa.Created,
-				ConfigJSON:       sa.ConfigJSON,
-				Group:            sa.Group,
-				Sync:             sa.Sync,
-				DesiredPlacement: sa.DesiredPlacement,
-				Consumers:        make([]*writeableConsumerAssignment, 0, len(sa.consumers)),
+				Client:     sa.Client.forAssignmentSnap(),
+				Created:    sa.Created,
+				ConfigJSON: sa.ConfigJSON,
+				Group:      sa.Group,
+				Sync:       sa.Sync,
+				Consumers:  make([]*writeableConsumerAssignment, 0, len(sa.consumers)),
 			}
 			for _, ca := range sa.consumers {
 				wca := writeableConsumerAssignment{
-					Client:           ca.Client.forAssignmentSnap(),
-					Created:          ca.Created,
-					Name:             ca.Name,
-					Stream:           ca.Stream,
-					ConfigJSON:       ca.ConfigJSON,
-					Group:            ca.Group,
-					DesiredPlacement: ca.DesiredPlacement,
+					Client:     ca.Client.forAssignmentSnap(),
+					Created:    ca.Created,
+					Name:       ca.Name,
+					Stream:     ca.Stream,
+					ConfigJSON: ca.ConfigJSON,
+					Group:      ca.Group,
 				}
 				wsa.Consumers = append(wsa.Consumers, &wca)
 				nca++
@@ -2433,28 +2424,39 @@ func (js *jetStream) setConsumerAssignmentRecovering(ca *consumerAssignment) {
 // Just copies over and changes out the group so it can be encoded.
 // Lock should be held.
 func (sa *streamAssignment) copyGroup() *streamAssignment {
-	csa, cg := sa.clone(), *sa.Group
-	csa.Group = &cg
-	csa.Group.Peers = copyStrings(sa.Group.Peers)
+	csa := sa.clone()
+	csa.Group = sa.Group.copyGroup()
 	return csa
 }
 
 // Just copies over and changes out the group so it can be encoded.
 // Lock should be held.
 func (ca *consumerAssignment) copyGroup() *consumerAssignment {
-	cca, cg := ca.clone(), *ca.Group
-	cca.Group = &cg
-	cca.Group.Peers = copyStrings(ca.Group.Peers)
+	cca := ca.clone()
+	cca.Group = ca.Group.copyGroup()
 	return cca
 }
 
-// Just copies over and changes out the group so it can be encoded.
+// copyGroup returns a copy of rg whose Peers slice and nested Desired placement
+// are independent of the original, so it can be mutated and encoded.
 // Lock should be held.
-func (desired *desiredGroupPlacement) copyGroup() *desiredGroupPlacement {
-	cd, cg := *desired, *desired.Group
-	cd.Group = &cg
-	cd.Group.Peers = copyStrings(desired.Group.Peers)
-	return &cd
+func (rg *raftGroup) copyGroup() *raftGroup {
+	if rg == nil {
+		return nil
+	}
+	cg := *rg
+	cg.Peers = copyStrings(rg.Peers)
+	if rg.Desired != nil {
+		cd := *rg.Desired
+		if rg.Desired.Group != nil {
+			dg := *rg.Desired.Group
+			dg.Peers = copyStrings(rg.Desired.Group.Peers)
+			dg.Desired = nil // leaf invariant: desired groups never nest
+			cd.Group = &dg
+		}
+		cg.Desired = &cd
+	}
+	return &cg
 }
 
 // Lock should be held.
@@ -2787,42 +2789,40 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, ru *recoveryUpdates) (bo
 	return isRecovering, didSnap, nil
 }
 
-func (cc *jetStreamCluster) isMemberOfStreamAssignment(sa *streamAssignment) bool {
+// isGroupMember reports whether this server is a member of rg's current or
+// desired peer set.
+func (cc *jetStreamCluster) isGroupMember(rg *raftGroup) bool {
 	if cc == nil || cc.meta == nil {
 		return false
 	}
-	ourID := cc.meta.ID()
-	if sa.Group != nil && sa.Group.isMember(ourID) {
+	return rg.isMemberOrDesired(cc.meta.ID())
+}
+
+// isMemberOrDesired reports whether id is in the current peer set or, while a
+// move/scale is in flight, in the desired peer set.
+func (rg *raftGroup) isMemberOrDesired(id string) bool {
+	if rg == nil {
+		return false
+	}
+	if rg.isMember(id) {
 		return true
 	}
-	if p := sa.DesiredPlacement; p != nil && p.Group != nil && p.Group.isMember(ourID) {
+	if d := rg.Desired; d != nil && d.Group != nil && d.Group.isMember(id) {
 		return true
 	}
 	return false
 }
 
-func (cc *jetStreamCluster) isMemberOfConsumerAssignment(ca *consumerAssignment) bool {
-	if cc == nil || cc.meta == nil {
-		return false
-	}
-	ourID := cc.meta.ID()
-	if ca.Group != nil && ca.Group.isMember(ourID) {
-		return true
-	}
-	if p := ca.DesiredPlacement; p != nil && p.Group != nil && p.Group.isMember(ourID) {
-		return true
-	}
-	return false
-}
-
-func (rg *raftGroup) combinePeersWithDesired(desired *desiredGroupPlacement) []string {
-	if desired == nil || desired.Group == nil {
+// combinePeersWithDesired returns the union of rg's current peers and, while a
+// move/scale is inflight, its desired peers.
+func (rg *raftGroup) combinePeersWithDesired() []string {
+	if rg.Desired == nil || rg.Desired.Group == nil {
 		return rg.Peers
 	}
 
 	peerSet := make([]string, 0, len(rg.Peers))
 	peerSet = append(peerSet, rg.Peers...)
-	for _, peer := range desired.Group.Peers {
+	for _, peer := range rg.Desired.Group.Peers {
 		if !slices.Contains(peerSet, peer) {
 			peerSet = append(peerSet, peer)
 		}
@@ -2878,7 +2878,7 @@ func (rg *raftGroup) setPreferred(s *Server) {
 }
 
 // createRaftGroup is called to spin up this raft group if needed.
-func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, desired *desiredGroupPlacement, recovering bool, storage StorageType, labels pprofLabels) (RaftNode, error) {
+func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, recovering bool, storage StorageType, labels pprofLabels) (RaftNode, error) {
 	// js.mu protects the lookup/registration of raft groups so that two parallel
 	// calls for the same identifier can't end up creating duplicate instances.
 	// It is released around blocking work (waiting for a previous instance to
@@ -2894,9 +2894,9 @@ func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, desired *des
 
 	ourID := cc.meta.ID()
 	isMember := rg.isMember(ourID)
-	peerSet := rg.combinePeersWithDesired(desired)
+	peerSet := rg.combinePeersWithDesired()
 	name, preferred, scaleUp := rg.Name, rg.Preferred, rg.ScaleUp
-	if desired != nil && desired.Group != nil {
+	if desired := rg.Desired; desired != nil && desired.Group != nil {
 		isMember = isMember || desired.Group.isMember(ourID)
 		// Note that the group name MUST NOT be different normally.
 		// However, when scaling up from R1 we've renamed it to mark a distinct replicated group.
@@ -2908,7 +2908,7 @@ func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, desired *des
 	}
 
 	// If this is a single peer raft group or we are not a member return.
-	if (desired == nil && len(peerSet) <= 1) || !isMember {
+	if (rg.Desired == nil && len(peerSet) <= 1) || !isMember {
 		// Nothing to do here.
 		return nil, nil
 	}
@@ -3845,17 +3845,17 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 
 	// Check if we're working with desired state.
 	js.mu.RLock()
-	if sa != nil && sa.DesiredPlacement != nil {
+	if sa != nil && sa.Group != nil && sa.Group.Desired != nil {
 		// If a membership change is in progress, we just wait for it to clear.
 		if n.MembershipChangeInProgress() {
 			js.mu.RUnlock()
 			return false
 		}
 
-		//isMoveRequest := sa.DesiredPlacement.Placement != nil
+		//isMoveRequest := sa.Group.Desired.Placement != nil
 		current := copyStrings(sa.Group.Peers)
 		actual := n.PeerNames()
-		desired := sa.DesiredPlacement.Group.Peers
+		desired := sa.Group.Desired.Group.Peers
 		foundAll := true
 		for _, peer := range desired {
 			if !slices.Contains(actual, peer) {
@@ -3915,7 +3915,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			Account: sa.Client.serviceAccount(),
 			Stream:  sa.Config.Name,
 			ActualPlacement: &assignmentUpdateActualPlacement{
-				ID:    sa.DesiredPlacement.ID,
+				ID:    sa.Group.Desired.ID,
 				Peers: actual,
 			},
 		}
@@ -4020,7 +4020,7 @@ func (mset *stream) isMigrating() bool {
 	if sa == nil || sa.Group == nil || sa.Group.node == nil {
 		return false
 	}
-	if sa.DesiredPlacement != nil {
+	if sa.Group.Desired != nil {
 		return true
 	}
 	// The sign of migration is if our group peer count != configured replica count.
@@ -4036,7 +4036,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 
 	// Check if we're working with desired state.
 	js.mu.RLock()
-	if ca != nil && ca.DesiredPlacement != nil {
+	if ca != nil && ca.Group != nil && ca.Group.Desired != nil {
 		// If a membership change is in progress, we just wait for it to clear.
 		if n.MembershipChangeInProgress() {
 			js.mu.RUnlock()
@@ -4044,7 +4044,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		}
 
 		actual := n.PeerNames()
-		desired := ca.DesiredPlacement.Group.Peers
+		desired := ca.Group.Desired.Group.Peers
 		foundAll := true
 		for _, peer := range desired {
 			if !slices.Contains(actual, peer) {
@@ -4081,7 +4081,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 			Stream:  ca.Stream,
 			Name:    ca.Name,
 			ActualPlacement: &assignmentUpdateActualPlacement{
-				ID:    ca.DesiredPlacement.ID,
+				ID:    ca.Group.Desired.ID,
 				Peers: actual,
 			},
 		}
@@ -4157,7 +4157,7 @@ func (o *consumer) isMigrating() bool {
 	if ca == nil || ca.Group == nil || ca.Group.node == nil {
 		return false
 	}
-	if ca.DesiredPlacement != nil {
+	if ca.Group.Desired != nil {
 		return true
 	}
 	// The sign of migration is if our group peer count != configured replica count.
@@ -5043,7 +5043,7 @@ func (js *jetStream) processStreamLeaderChange(mset *stream, isLeader bool) {
 			Created:   mset.createdTime(),
 			State:     mset.state(),
 			Config:    *setDynamicStreamMetadata(&msetCfg),
-			Cluster:   js.clusterInfoOfStreamAssignment(mset.streamAssignment()),
+			Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
 			Sources:   mset.sourcesInfo(),
 			Mirror:    mset.mirrorInfo(),
 			TimeStamp: time.Now().UTC(),
@@ -5241,7 +5241,7 @@ func (js *jetStream) processStreamAssignment(sa *streamAssignment) {
 		return
 	}
 
-	isMember := cc.isMemberOfStreamAssignment(sa)
+	isMember := cc.isGroupMember(sa.Group)
 
 	// Remove this stream from the inflight proposals
 	cc.removeInflightStreamProposal(accName, sa.Config.Name)
@@ -5356,7 +5356,7 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 	// Remove this stream from the inflight proposals
 	cc.removeInflightStreamProposal(accName, sa.Config.Name)
 
-	isMember := cc.isMemberOfStreamAssignment(sa)
+	isMember := cc.isGroupMember(sa.Group)
 
 	accStreams := cc.streams[accName]
 	if accStreams == nil {
@@ -5378,7 +5378,7 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 
 	// If we detect we are scaling down to 1, non-clustered, and we had a previous node, clear it here.
 	// FIXME(mvv): this is unsafe
-	if sa.Config.Replicas == 1 && sa.Group.node != nil && sa.DesiredPlacement == nil {
+	if sa.Config.Replicas == 1 && sa.Group.node != nil && sa.Group.Desired == nil {
 		sa.Group.node = nil
 	}
 
@@ -5485,7 +5485,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	}
 
 	js.mu.RLock()
-	s, rg, desired := js.srv, sa.Group, sa.DesiredPlacement
+	s, rg, desired := js.srv, sa.Group, sa.Group.Desired
 	client, subject, reply := sa.Client, sa.Subject, sa.Reply
 	alreadyRunning, numReplicas := osa.Group.node != nil, len(rg.Peers)
 	needsNode := rg.node == nil
@@ -5522,7 +5522,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 				mset.startClusterSubs()
 				mset.mu.Unlock()
 
-				js.createRaftGroup(acc.GetName(), rg, desired, recovering, storage, pprofLabels{
+				js.createRaftGroup(acc.GetName(), rg, recovering, storage, pprofLabels{
 					"type":    "stream",
 					"account": mset.accName(),
 					"stream":  mset.name(),
@@ -5557,7 +5557,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			rg.node = nil
 			js.mu.Unlock()
 		} else {
-			js.createRaftGroup(acc.GetName(), rg, desired, recovering, storage, pprofLabels{
+			js.createRaftGroup(acc.GetName(), rg, recovering, storage, pprofLabels{
 				"type":    "stream",
 				"account": mset.accName(),
 				"stream":  mset.name(),
@@ -5630,7 +5630,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		Created:   mset.createdTime(),
 		State:     mset.state(),
 		Config:    *setDynamicStreamMetadata(&msetCfg),
-		Cluster:   js.clusterInfoOfStreamAssignment(mset.streamAssignment()),
+		Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
 		Mirror:    mset.mirrorInfo(),
 		Sources:   mset.sourcesInfo(),
 		TimeStamp: time.Now().UTC(),
@@ -5647,7 +5647,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	}
 
 	js.mu.RLock()
-	s, rg, desired, created := js.srv, sa.Group, sa.DesiredPlacement, sa.Created
+	s, rg, created := js.srv, sa.Group, sa.Created
 	alreadyRunning := rg.node != nil
 	storage := sa.Config.Storage
 	restore := sa.Restore
@@ -5656,7 +5656,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	js.mu.RUnlock()
 
 	// Process the raft group and make sure it's running if needed.
-	_, err := js.createRaftGroup(acc.GetName(), rg, desired, recovering, storage, pprofLabels{
+	_, err := js.createRaftGroup(acc.GetName(), rg, recovering, storage, pprofLabels{
 		"type":    "stream",
 		"account": acc.Name,
 		"stream":  sa.Config.Name,
@@ -5700,7 +5700,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 								Created:   mset.createdTime(),
 								State:     mset.state(),
 								Config:    *setDynamicStreamMetadata(&msetCfg),
-								Cluster:   js.clusterInfoOfStreamAssignment(mset.streamAssignment()),
+								Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
 								Sources:   mset.sourcesInfo(),
 								Mirror:    mset.mirrorInfo(),
 								TimeStamp: time.Now().UTC(),
@@ -5730,7 +5730,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 					// FIXME(mvv): I don't think this makes any sense, should probably just cut our losses and remove the below?
 					if osa != nil {
 						// Process the raft group and make sure it's running if needed.
-						js.createRaftGroup(acc.GetName(), osa.Group, osa.DesiredPlacement, osa.recovering, storage, pprofLabels{
+						js.createRaftGroup(acc.GetName(), osa.Group, osa.recovering, storage, pprofLabels{
 							"type":    "stream",
 							"account": mset.accName(),
 							"stream":  mset.name(),
@@ -5935,10 +5935,7 @@ func (js *jetStream) processStreamRemoval(sa *streamAssignment) {
 		return
 	}
 	accName, stream, created := sa.Client.serviceAccount(), sa.Config.Name, sa.Created
-	var isMember bool
-	if sa.Group != nil {
-		isMember = sa.Group.isMember(cc.meta.ID())
-	}
+	isMember := cc.isGroupMember(sa.Group)
 	wasLeader := cc.isStreamLeader(accName, stream)
 
 	// Check if we already have this assigned.
@@ -6078,7 +6075,7 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 	accName, stream, consumerName := ca.Client.serviceAccount(), ca.Stream, ca.Name
 	noMeta := cc == nil || cc.meta == nil
 	shuttingDown := js.shuttingDown
-	isMember := cc.isMemberOfConsumerAssignment(ca)
+	isMember := cc.isGroupMember(ca.Group)
 	js.mu.RUnlock()
 
 	if s == nil || noMeta || shuttingDown {
@@ -6288,7 +6285,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 	}
 	js.mu.RLock()
 	s := js.srv
-	rg, desired := ca.Group, ca.DesiredPlacement
+	rg := ca.Group
 	alreadyRunning := rg != nil && rg.node != nil
 	accName, stream, consumer := ca.Client.serviceAccount(), ca.Stream, ca.Name
 	recovering := ca.recovering
@@ -6342,7 +6339,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 		storage = MemoryStorage
 	}
 	// No-op if R1.
-	js.createRaftGroup(accName, rg, desired, recovering, storage, pprofLabels{
+	js.createRaftGroup(accName, rg, recovering, storage, pprofLabels{
 		"type":     "consumer",
 		"account":  mset.accName(),
 		"stream":   ca.Stream,
@@ -6497,7 +6494,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 			o.setCreatedTime(ca.Created)
 		} else {
 			// Check for scale down to 1..
-			if node != nil && len(rg.Peers) == 1 && desired == nil {
+			if node != nil && len(rg.Peers) == 1 && rg.Desired == nil {
 				o.clearNode()
 				o.stopMonitoring()
 				// Need to clear from rg too.
@@ -6788,13 +6785,7 @@ func (cc *jetStreamCluster) isConsumerAssigned(a *Account, stream, consumer stri
 	if ca == nil {
 		return false
 	}
-	ourID := cc.meta.ID()
-	if ca.DesiredPlacement != nil {
-		if ca.DesiredPlacement.Group.isMember(ourID) {
-			return true
-		}
-	}
-	return ca.Group.isMember(ourID)
+	return ca.Group.isMemberOrDesired(cc.meta.ID())
 }
 
 // Returns our stream and underlying raft node.
@@ -7696,32 +7687,33 @@ func (js *jetStream) processStreamAssignmentUpdates(sub *subscription, c *client
 	}
 
 	osa := js.streamAssignmentOrInflight(update.Account, update.Stream)
-	if osa == nil || osa.DesiredPlacement == nil || update.ActualPlacement == nil || osa.DesiredPlacement.ID != update.ActualPlacement.ID {
+	if osa == nil || osa.Group == nil || osa.Group.Desired == nil || update.ActualPlacement == nil || osa.Group.Desired.ID != update.ActualPlacement.ID {
 		return
 	}
-	desired := copyStrings(osa.DesiredPlacement.Group.Peers)
+	desired := copyStrings(osa.Group.Desired.Group.Peers)
 	slices.Sort(desired)
 	slices.Sort(update.ActualPlacement.Peers)
 	exactMatch := slices.Equal(desired, update.ActualPlacement.Peers)
 
+	// copyGroup deep-copies the group and its nested Desired, so sa is fully
+	// independent of the committed osa and we can mutate it freely below.
 	sa := osa.copyGroup()
 	// Remove the original update reply, since this change is internal.
 	sa.Reply = _EMPTY_
 	if exactMatch {
-		// If it's an exact match, we set the group to the desired state.
-		sa.Group = osa.DesiredPlacement.Group
+		// If it's an exact match, promote the desired placement to be the group.
 		// Copy the config so we can overwrite the placement.
 		newCfg := *sa.Config
-		newCfg.Placement = osa.DesiredPlacement.Placement
+		newCfg.Placement = osa.Group.Desired.Placement
 		sa.Config = &newCfg
-		// We can unset it now.
-		sa.DesiredPlacement = nil
+		sa.Group = sa.Group.Desired.Group
+		// Promoted group is now the current state; clear any desired marker.
+		sa.Group.Desired = nil
 	} else {
 		// If it doesn't match, we still update the actual peer set, but we update the desired state ID too.
 		// Updating the ID makes sure it can only be "consumed" once to perform an update.
 		sa.Group.Peers = update.ActualPlacement.Peers
-		sa.DesiredPlacement = osa.DesiredPlacement.copyGroup()
-		sa.DesiredPlacement.ID = nuid.Next()
+		sa.Group.Desired.ID = nuid.Next()
 	}
 
 	if err := cc.meta.Propose(encodeUpdateStreamAssignment(sa)); err == nil {
@@ -7750,27 +7742,29 @@ func (js *jetStream) processConsumerAssignmentUpdates(sub *subscription, c *clie
 	}
 
 	oca := js.consumerAssignmentOrInflight(update.Account, update.Stream, update.Name)
-	if oca == nil || oca.DesiredPlacement == nil || update.ActualPlacement == nil || oca.DesiredPlacement.ID != update.ActualPlacement.ID {
+	if oca == nil || oca.Group == nil || oca.Group.Desired == nil || update.ActualPlacement == nil || oca.Group.Desired.ID != update.ActualPlacement.ID {
 		return
 	}
-	desired := copyStrings(oca.DesiredPlacement.Group.Peers)
+	desired := copyStrings(oca.Group.Desired.Group.Peers)
 	slices.Sort(desired)
 	slices.Sort(update.ActualPlacement.Peers)
 	exactMatch := slices.Equal(desired, update.ActualPlacement.Peers)
 
+	// copyGroup deep-copies the group and its nested Desired, so ca is fully
+	// independent of the committed oca and we can mutate it freely below.
 	ca := oca.copyGroup()
 	// Remove the original update reply, since this change is internal.
 	ca.Reply = _EMPTY_
 	if exactMatch {
-		// If it's an exact match, we set the group to the desired state, and we unset it.
-		ca.Group = oca.DesiredPlacement.Group
-		ca.DesiredPlacement = nil
+		// If it's an exact match, promote the desired placement to be the group.
+		ca.Group = ca.Group.Desired.Group
+		// Promoted group is now the current state; clear any desired marker.
+		ca.Group.Desired = nil
 	} else {
 		// If it doesn't match, we still update the actual peer set, but we update the desired state ID too.
 		// Updating the ID makes sure it can only be "consumed" once to perform an update.
 		ca.Group.Peers = update.ActualPlacement.Peers
-		ca.DesiredPlacement = oca.DesiredPlacement.copyGroup()
-		ca.DesiredPlacement.ID = nuid.Next()
+		ca.Group.Desired.ID = nuid.Next()
 	}
 
 	if err := cc.meta.Propose(encodeAddConsumerAssignment(ca)); err == nil {
@@ -8746,7 +8740,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	var consumers []*consumerAssignment
 
 	// Check if this is a move request, but no cancellation, and we are already moving this stream.
-	if osa.DesiredPlacement != nil {
+	if osa.Group != nil && osa.Group.Desired != nil {
 		resp.Error = NewJSStreamMoveInProgressError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
@@ -8970,15 +8964,21 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 			// FIXME(mvv): should this still be done when scaling down to R1?
-			cca.DesiredPlacement = &desiredGroupPlacement{
+			// cca.Group currently holds the new (scaled/moved) peer set: that is the
+			// desired state. Keep the current group as an independent copy of the live
+			// consumer group and attach the desired placement to it, so the committed
+			// assignment's group is never mutated.
+			desiredGroup := cca.Group
+			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+			cca.Group = ca.Group.copyGroup()
+			cca.Group.Desired = &desiredGroupPlacement{
 				ID:    nuid.Next(),
-				Group: cca.Group,
+				Group: desiredGroup,
 			}
-			cca.Group = ca.Group
 
 			// make sure it overlaps with peers and remove if not
 			if cca.Group.Preferred != _EMPTY_ {
-				combined := cca.Group.combinePeersWithDesired(cca.DesiredPlacement)
+				combined := cca.Group.combinePeersWithDesired()
 				if !slices.Contains(combined, cca.Group.Preferred) {
 					cca.Group.Preferred = _EMPTY_
 				}
@@ -9000,9 +9000,12 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	if isMoveRequest || isReplicaChange {
 		// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 		// FIXME(mvv): should this still be done when scaling down to R1?
-		//sa.Group = osa.copyGroup().Group
-		//sa.Group.Name = rg.Name
-		sa.DesiredPlacement = &desiredGroupPlacement{
+		// rg already holds the desired peer set (a copy of osa.Group). Attach it as
+		// the desired placement on an independent copy of the current group so the
+		// committed osa.Group is never mutated.
+		rg.Desired = nil // leaf invariant: desired groups never nest
+		sa.Group = osa.Group.copyGroup()
+		sa.Group.Desired = &desiredGroupPlacement{
 			ID:        nuid.Next(),
 			Placement: newCfg.Placement,
 			Group:     rg,
@@ -10029,7 +10032,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 			Created: time.Now().UTC(),
 		}
 	} else {
-		if ca.DesiredPlacement != nil {
+		if ca.Group != nil && ca.Group.Desired != nil {
 			resp.Error = NewJSConsumerMoveInProgressError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 			return
@@ -10121,11 +10124,17 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		if rBefore != rAfter {
 			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 			// FIXME(mvv): should this still be done when scaling down to R1?
-			nca.DesiredPlacement = &desiredGroupPlacement{
+			// nca.Group currently holds the new (scaled) peer set: that is the desired
+			// state. Keep the current group as an independent copy of the live consumer
+			// group and attach the desired placement to it, so the committed assignment's
+			// group is never mutated.
+			desiredGroup := nca.Group
+			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+			nca.Group = ca.Group.copyGroup()
+			nca.Group.Desired = &desiredGroupPlacement{
 				ID:    nuid.Next(),
-				Group: nca.Group,
+				Group: desiredGroup,
 			}
-			nca.Group = ca.Group
 		}
 		ca = nca
 	}
@@ -11299,42 +11308,23 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 	return ci
 }
 
-func (js *jetStream) clusterInfoOfStreamAssignment(sa *streamAssignment) *ClusterInfo {
+// clusterInfoOfGroup builds the ClusterInfo for a stream's or consumer's raft
+// group, including any in-flight desired placement carried on the group. The
+// group may be nil (e.g. not assigned here yet), in which case a minimal
+// ClusterInfo is returned.
+func (js *jetStream) clusterInfoOfGroup(rg *raftGroup) *ClusterInfo {
 	if js == nil {
 		return nil
 	}
 	js.mu.RLock()
 	defer js.mu.RUnlock()
-
-	if sa == nil {
-		return &ClusterInfo{
-			Name:   js.srv.cachedClusterName(),
-			Leader: js.srv.Name(),
-		}
-	}
-	return js.clusterInfoWithDesired(sa.Group, sa.DesiredPlacement)
-}
-
-func (js *jetStream) clusterInfoOfConsumerAssignment(ca *consumerAssignment) *ClusterInfo {
-	if js == nil {
-		return nil
-	}
-	js.mu.RLock()
-	defer js.mu.RUnlock()
-
-	if ca == nil {
-		return &ClusterInfo{
-			Name:   js.srv.cachedClusterName(),
-			Leader: js.srv.Name(),
-		}
-	}
-	return js.clusterInfoWithDesired(ca.Group, ca.DesiredPlacement)
+	return js.clusterInfoWithDesired(rg)
 }
 
 // Lock should be held.
-func (js *jetStream) clusterInfoWithDesired(rg *raftGroup, desired *desiredGroupPlacement) *ClusterInfo {
+func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 	s := js.srv
-	if rg == nil || (rg.node == nil && desired == nil) {
+	if rg == nil || (rg.node == nil && rg.Desired == nil) {
 		return &ClusterInfo{
 			Name:   s.cachedClusterName(),
 			Leader: s.Name(),
@@ -11348,8 +11338,8 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup, desired *desiredGroup
 	}
 
 	var desiredRg *raftGroup
-	if desired != nil && desired.Group != nil {
-		desiredRg = desired.Group
+	if rg.Desired != nil && rg.Desired.Group != nil {
+		desiredRg = rg.Desired.Group
 	}
 
 	id := s.Node()
@@ -11428,7 +11418,7 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup, desired *desiredGroup
 		ci.Desired = &DesiredClusterInfo{
 			Name:      desiredRg.Cluster,
 			RaftGroup: desiredRg.Name,
-			Placement: desired.Placement,
+			Placement: rg.Desired.Placement,
 		}
 		for _, peer := range desiredRg.Peers {
 			pi := generatePeer(peer)
@@ -11545,7 +11535,7 @@ func (mset *stream) processClusterStreamInfoRequest(reply string) {
 		Created:   mset.createdTime(),
 		State:     mset.state(),
 		Config:    config,
-		Cluster:   js.clusterInfoOfStreamAssignment(mset.streamAssignment()),
+		Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
 		Sources:   mset.sourcesInfo(),
 		Mirror:    mset.mirrorInfo(),
 		TimeStamp: time.Now().UTC(),
