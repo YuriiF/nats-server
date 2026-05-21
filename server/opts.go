@@ -229,13 +229,15 @@ type LeafNodeOpts struct {
 	// east-west propagation.
 	IsolateLeafnodeInterest bool `json:"-"`
 
-	// CompactInboxInterest enables the "_LR_" leaf reply mechanism: local
-	// client inbox (_INBOX.) subscriptions are advertised across leaf
-	// connections as a single per-server reply wildcard instead of one
-	// LS+ per unique inbox subject. Request reply subjects crossing the leaf
-	// are rewritten to that prefix and restored on the originating server.
-	// This trims the propagated interest graph (see _GR_ for gateways).
-	CompactInboxInterest bool `json:"-"`
+	// NoCompactInterest disables the "_LR_" leaf reply mechanism on this
+	// server. When both ends of a leaf connection support "_LR_" (the
+	// default), local client subscriptions matching the eligible patterns
+	// are advertised across the leaf as a single per-server reply wildcard
+	// instead of one LS+ per subject, and reply subjects crossing the leaf
+	// are rewritten/restored accordingly. This trims the propagated interest
+	// graph (see _GR_ for gateways). The eligible patterns default to
+	// "_INBOX.>" and can be extended per remote via RemoteLeafOpts.CompactInterest.
+	NoCompactInterest bool `json:"-"`
 
 	// Not exported, for tests.
 	resolver    netResolver
@@ -325,6 +327,15 @@ type RemoteLeafOpts struct {
 	// returned by the hub, allowing the user to fully manage the servers this
 	// remote can connect to.
 	IgnoreDiscoveredServers bool `json:"-"`
+
+	// CompactInterest is the set of subject patterns whose subscriptions are
+	// eligible to be collapsed into this server's single "_LR_" reply route
+	// over this leaf connection, trimming propagated interest. "_INBOX.>" is
+	// always eligible when both ends support "_LR_"; entries here extend that
+	// set (e.g. additional deliver/request-reply prefixes, or ">" to collapse
+	// all subscriptions). Only applies if the connected remote also supports
+	// "_LR_".
+	CompactInterest []string `json:"-"`
 }
 
 // Returns a string representation of this `RemoteLeafOpts` object, containing
@@ -2884,6 +2895,8 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 			}
 		case "isolate_leafnode_interest", "isolate":
 			opts.LeafNode.IsolateLeafnodeInterest = mv.(bool)
+		case "no_compact_interest", "disable_lr":
+			opts.LeafNode.NoCompactInterest = mv.(bool)
 		case "write_deadline":
 			opts.LeafNode.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
@@ -3148,6 +3161,13 @@ func parseRemoteLeafNodes(v any, errors *[]error, warnings *[]error) ([]*RemoteL
 					continue
 				}
 				remote.DenyExports = subjects
+			case "compact_interest", "lr_collapse":
+				subjects, err := parsePermSubjects(tk, errors)
+				if err != nil {
+					*errors = append(*errors, err)
+					continue
+				}
+				remote.CompactInterest = subjects
 			case "ws_compress", "ws_compression", "websocket_compress", "websocket_compression":
 				remote.Websocket.Compression = v.(bool)
 			case "ws_no_masking", "websocket_no_masking":

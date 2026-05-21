@@ -106,6 +106,12 @@ type leaf struct {
 	compression string
 	// This is for GW map replies.
 	gwSub *subscription
+	// "_LR_" leaf reply (interest compaction). lrEnabled is set during connection
+	// setup when both ends support it. lrEligible holds the subject patterns whose
+	// subscriptions are collapsed into this server's reply wildcard over this
+	// connection (always includes "_INBOX.>", extended per remote config).
+	lrEnabled  bool
+	lrEligible *Sublist
 }
 
 // Used for remote (solicited) leafnodes.
@@ -994,6 +1000,7 @@ func (s *Server) startLeafNodeAcceptLoop() {
 		Proto:         s.getServerProto(),
 		InfoOnConnect: true,
 		JSApiLevel:    JSApiLevel,
+		LR:            s.leafNodeReplySupported(),
 	}
 	// If we have selected a random port...
 	if port == 0 {
@@ -1058,6 +1065,7 @@ func (c *client) sendLeafConnect(clusterName string, headers bool) error {
 		RemoteAccount: c.acc.GetName(),
 		Proto:         c.srv.getServerProto(),
 		Isolate:       c.leaf.remote.RequestIsolation,
+		LR:            c.srv.leafNodeReplySupported(),
 	}
 
 	// If a signature callback is specified, this takes precedence over anything else.
@@ -1644,6 +1652,11 @@ func (c *client) processLeafnodeInfo(info *Info) {
 		supportsHeaders := c.srv.supportsHeaders()
 		c.headers = supportsHeaders && info.Headers
 
+		// "_LR_" leaf reply is active only when both ends support it. The
+		// soliciting side learns the remote's support from its INFO.
+		c.leaf.lrEnabled = c.srv.leafNodeReplySupported() && info.LR
+		c.buildLeafReplyEligible()
+
 		// Remember the remote server.
 		// Pre 2.2.0 servers are not sending their server name.
 		// In that case, use info.ID, which, for those servers, matches
@@ -2158,6 +2171,10 @@ type leafConnectInfo struct {
 	// Tells the accept side which account the remote is binding to.
 	RemoteAccount string `json:"remote_account,omitempty"`
 
+	// Indicates that the soliciting side supports the "_LR_" leaf reply
+	// (interest compaction) mechanism.
+	LR bool `json:"lr,omitempty"`
+
 	// The accept side of a LEAF connection, unlike ROUTER and GATEWAY, receives
 	// only the CONNECT protocol, and no INFO. So we need to send the protocol
 	// version as part of the CONNECT. It will indicate if a connection supports
@@ -2234,6 +2251,10 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	// support headers and the remote has sent in the CONNECT protocol that it does
 	// support headers too.
 	c.headers = supportHeaders && proto.Headers
+	// "_LR_" leaf reply is active only when both ends support it. The accept
+	// side learns the remote's support from the CONNECT.
+	c.leaf.lrEnabled = c.srv.leafNodeReplySupported() && proto.LR
+	c.buildLeafReplyEligible()
 	// If the compression level is still not set, set it based on what has been
 	// given to us in the CONNECT protocol.
 	if c.leaf.compression == _EMPTY_ {
@@ -2783,22 +2804,18 @@ func (c *client) sendLeafNodeSubUpdate(key string, n int32) {
 	c.enqueueProto(b.Bytes())
 }
 
-// Helper function to build the key.
 // Avoid per-call allocations when prefix-checking subjects on hot paths.
-var (
-	leafReplyPrefixBytes = []byte(leafReplyPrefix)
-	leafInboxPrefixBytes = []byte("_INBOX.")
-)
+var leafReplyPrefixBytes = []byte(leafReplyPrefix)
 
-// leafNodeReplyEnabled reports whether the "_LR_" inbox interest compaction
-// is enabled on this server.
-func (s *Server) leafNodeReplyEnabled() bool {
-	return s != nil && s.lrReplyPfx != nil
-}
+// leafInboxWildcard is the default eligible pattern for "_LR_" collapse: it is
+// always present so that client reply inboxes are compacted by default.
+const leafInboxWildcard = "_INBOX.>"
 
-// isInboxSubject reports whether subj is a client inbox subject (_INBOX.<...>).
-func isInboxSubject(subj []byte) bool {
-	return bytes.HasPrefix(subj, leafInboxPrefixBytes)
+// leafNodeReplySupported reports whether this server participates in the "_LR_"
+// leaf reply (interest compaction) mechanism. On by default; disabled via
+// LeafNode.NoCompactInterest.
+func (s *Server) leafNodeReplySupported() bool {
+	return s != nil && s.lrSupported
 }
 
 // isLeafReplySubject reports whether subj carries the "_LR_" leaf reply prefix.
@@ -2806,13 +2823,36 @@ func isLeafReplySubject(subj []byte) bool {
 	return bytes.HasPrefix(subj, leafReplyPrefixBytes)
 }
 
+// buildLeafReplyEligible compiles the subject patterns whose subscriptions are
+// eligible for "_LR_" reply collapse over this leaf connection into an efficient
+// sublist matcher. "_INBOX.>" is always eligible; per-remote CompactInterest
+// patterns extend it. No-op if "_LR_" is not active on the connection.
+// Lock should be held (modifies c.leaf).
+func (c *client) buildLeafReplyEligible() {
+	if c.leaf == nil || !c.leaf.lrEnabled {
+		return
+	}
+	sl := NewSublistNoCache()
+	sl.Insert(&subscription{subject: []byte(leafInboxWildcard)})
+	if r := c.leaf.remote; r != nil {
+		for _, p := range r.CompactInterest {
+			if p != _EMPTY_ {
+				sl.Insert(&subscription{subject: []byte(p)})
+			}
+		}
+	}
+	c.leaf.lrEligible = sl
+}
+
 // leafSmapKey returns the key under which sub is advertised to a leaf
-// connection. With compaction enabled, a local client inbox subscription is
-// collapsed under this server's single "_LR_" reply wildcard so that unique
-// _INBOX.<nuid> subjects are not propagated individually.
+// connection. When "_LR_" is active, a local client subscription whose subject
+// matches an eligible pattern is collapsed under this server's single "_LR_"
+// reply wildcard so that unique reply/inbox subjects are not propagated
+// individually.
 func (c *client) leafSmapKey(sub *subscription) string {
 	if sub.queue == nil && sub.client != nil && sub.client.kind == CLIENT &&
-		c.srv.leafNodeReplyEnabled() && isInboxSubject(sub.subject) {
+		c.leaf != nil && c.leaf.lrEnabled && c.leaf.lrEligible != nil &&
+		c.leaf.lrEligible.HasInterest(string(sub.subject)) {
 		return c.srv.lrReplyWildcard
 	}
 	return keyFromSub(sub)
@@ -3296,11 +3336,11 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		return
 	}
 
-	// "_LR_" leaf reply: if this is a compacted inbox reply destined for this
-	// server, restore the original _INBOX subject before matching so it finds
-	// the local inbox subscription. The prefix carries this server's hash, so
-	// only replies that belong here are restored.
-	if srv.leafNodeReplyEnabled() && bytes.HasPrefix(c.pa.subject, srv.lrReplyPfx) {
+	// "_LR_" leaf reply: if this is a compacted reply destined for this server,
+	// restore the original subject before matching so it finds the local
+	// subscription. The prefix carries this server's hash, so only replies that
+	// belong here are restored.
+	if c.leaf != nil && c.leaf.lrEnabled && bytes.HasPrefix(c.pa.subject, srv.lrReplyPfx) {
 		c.pa.subject = c.pa.subject[len(srv.lrReplyPfx):]
 	}
 	subject := string(c.pa.subject)

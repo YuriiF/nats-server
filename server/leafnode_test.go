@@ -10482,6 +10482,9 @@ func TestLeafNodeLMSGHonorsPublishPermissions(t *testing.T) {
 // permissions such as allow_responses after the hub has tracked a reply
 // subject for a request sent to the leaf.
 func TestLeafNodeHubSideLMSGHonorsAllowResponses(t *testing.T) {
+	// This test hand-crafts LMSG protocol with explicit inbox reply subjects,
+	// so disable the "_LR_" reply rewriting which would otherwise rewrite the
+	// reply subject on the wire.
 	hubConf := createConfFile(t, []byte(`
 		server_name: "HUB"
 		listen: "127.0.0.1:-1"
@@ -10504,6 +10507,7 @@ func TestLeafNodeHubSideLMSGHonorsAllowResponses(t *testing.T) {
 		leafnodes {
 			listen: "127.0.0.1:-1"
 			compression: off
+			no_compact_interest: true
 		}
 	`))
 	hub, ohub := RunServerWithConfig(hubConf)

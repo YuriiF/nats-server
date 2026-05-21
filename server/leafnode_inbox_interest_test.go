@@ -24,9 +24,11 @@ import (
 )
 
 // runInboxInterestLeafPair starts a hub (accepting leaf connections) and a
-// spoke (soliciting up to the hub), optionally enabling the "_LR_" inbox
-// interest compaction on both. It returns once the leaf link is established.
-func runInboxInterestLeafPair(t *testing.T, compact bool) (hub, spoke *Server) {
+// spoke (soliciting up to the hub). When lr is true the "_LR_" mechanism is
+// left at its default (on, capability-negotiated); when false it is disabled on
+// both ends. Any spokePatterns are configured as the spoke remote's
+// CompactInterest (extending the default "_INBOX.>"). Returns once connected.
+func runInboxInterestLeafPair(t *testing.T, lr bool, spokePatterns ...string) (hub, spoke *Server) {
 	t.Helper()
 
 	lo := DefaultTestOptions
@@ -34,15 +36,15 @@ func runInboxInterestLeafPair(t *testing.T, compact bool) (hub, spoke *Server) {
 	lo.LeafNode.Host = lo.Host
 	lo.LeafNode.Port = -1
 	lo.NoSystemAccount = true
-	lo.LeafNode.CompactInboxInterest = compact
+	lo.LeafNode.NoCompactInterest = !lr
 	hub = RunServer(&lo)
 
 	so := DefaultTestOptions
 	so.Port = -1
 	so.NoSystemAccount = true
-	so.LeafNode.CompactInboxInterest = compact
+	so.LeafNode.NoCompactInterest = !lr
 	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lo.LeafNode.Host, lo.LeafNode.Port))
-	so.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
+	so.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{rurl}, CompactInterest: spokePatterns}}
 	so.LeafNode.ReconnectInterval = 50 * time.Millisecond
 	spoke = RunServer(&so)
 
@@ -88,12 +90,15 @@ func inboxSubBreakdown(s *Server) (local, remote, lds, lr int) {
 //   - Does the subject interest graph propagate across the leaf connection?
 //   - Do both servers end up with 10 local subs and 10 remote-registered subs?
 func TestLeafNodeInboxInterestPropagation(t *testing.T) {
-	// Hub: accepts leaf node connections.
+	// Hub: accepts leaf node connections. Disable "_LR_" so this documents the
+	// uncollapsed baseline (disabling on one end is enough: it is mutually
+	// negotiated).
 	lo := DefaultTestOptions
 	lo.Port = -1
 	lo.LeafNode.Host = lo.Host
 	lo.LeafNode.Port = -1
 	lo.NoSystemAccount = true
+	lo.LeafNode.NoCompactInterest = true
 	hub := RunServer(&lo)
 	defer hub.Shutdown()
 
@@ -300,4 +305,114 @@ func checkSubInterestServer(t *testing.T, s *Server, subj string) {
 		}
 		return nil
 	})
+}
+
+// Per-remote configuration extends the eligible set beyond the default
+// "_INBOX.>". Here the spoke also collapses "deliver.>". Subscriptions matching
+// either pattern collapse into the single reply wildcard; a non-eligible
+// subject still propagates as its own interest entry.
+func TestLeafNodeInboxInterestLRCustomPatterns(t *testing.T) {
+	hub, spoke := runInboxInterestLeafPair(t, true, "deliver.>")
+	defer hub.Shutdown()
+	defer spoke.Shutdown()
+
+	ncSpoke := natsConnect(t, spoke.ClientURL())
+	defer ncSpoke.Close()
+
+	// 5 inbox subs + 5 deliver subs (both eligible) -> collapse to 1 remote.
+	for i := 0; i < 5; i++ {
+		natsSubSync(t, ncSpoke, nats.NewInbox())
+		natsSubSync(t, ncSpoke, fmt.Sprintf("deliver.%d", i))
+	}
+	// One non-eligible subject -> must still propagate as its own interest.
+	natsSubSync(t, ncSpoke, "other.subject")
+	natsFlush(t, ncSpoke)
+
+	// On the hub: 1 collapsed "_LR_" wildcard + 1 normal "other.subject" sub.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		_, remote, _, lr := inboxSubBreakdown(hub)
+		if remote != 2 || lr != 1 {
+			return fmt.Errorf("hub: want 2 remote (1 _LR_ + 1 plain), got %d remote (%d _LR_)", remote, lr)
+		}
+		return nil
+	})
+	if !hub.globalAccount().SubscriptionInterest("other.subject") {
+		t.Fatalf("hub should still carry the non-eligible 'other.subject' interest")
+	}
+	if !hub.globalAccount().SubscriptionInterest(spoke.lrReplyWildcard) {
+		t.Fatalf("hub should carry the spoke reply wildcard %q", spoke.lrReplyWildcard)
+	}
+
+	// Correctness: a request whose reply is a custom-eligible subject (deliver.*)
+	// must still route back across the leaf.
+	ncHub := natsConnect(t, hub.ClientURL())
+	defer ncHub.Close()
+	natsSub(t, ncHub, "svc", func(m *nats.Msg) { m.Respond([]byte("ok")) })
+	natsFlush(t, ncHub)
+	checkSubInterestServer(t, spoke, "svc")
+
+	reply := "deliver.reply.42"
+	sub := natsSubSync(t, ncSpoke, reply)
+	natsFlush(t, ncSpoke)
+	if err := ncSpoke.PublishRequest("svc", reply, []byte("ping")); err != nil {
+		t.Fatalf("publish request: %v", err)
+	}
+	if msg := natsNexMsg(t, sub, 2*time.Second); string(msg.Data) != "ok" {
+		t.Fatalf("unexpected reply on custom subject: %q", msg.Data)
+	}
+}
+
+// Capability gating: if either end does not support "_LR_", nothing is
+// collapsed and interest propagates per-subject as before.
+func TestLeafNodeInboxInterestLRDisabled(t *testing.T) {
+	hub, spoke := runInboxInterestLeafPair(t, false)
+	defer hub.Shutdown()
+	defer spoke.Shutdown()
+
+	ncSpoke := natsConnect(t, spoke.ClientURL())
+	defer ncSpoke.Close()
+	for i := 0; i < 10; i++ {
+		natsSubSync(t, ncSpoke, nats.NewInbox())
+	}
+	natsFlush(t, ncSpoke)
+
+	// No collapse: 10 individual inbox subs propagate to the hub, 0 are "_LR_".
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		_, remote, _, lr := inboxSubBreakdown(hub)
+		if remote != 10 || lr != 0 {
+			return fmt.Errorf("hub: want 10 remote and 0 _LR_, got %d remote (%d _LR_)", remote, lr)
+		}
+		return nil
+	})
+}
+
+// The config parser accepts compact_interest patterns per remote.
+func TestLeafNodeInboxInterestLRConfigParse(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		leafnodes {
+			remotes [
+				{
+					url: "nats-leaf://127.0.0.1:7422"
+					compact_interest: ["_INBOX.>", "deliver.>", "$KV.>"]
+				}
+			]
+		}
+	`))
+	opts, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+	if len(opts.LeafNode.Remotes) != 1 {
+		t.Fatalf("expected 1 remote, got %d", len(opts.LeafNode.Remotes))
+	}
+	got := opts.LeafNode.Remotes[0].CompactInterest
+	want := []string{"_INBOX.>", "deliver.>", "$KV.>"}
+	if len(got) != len(want) {
+		t.Fatalf("compact_interest: want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("compact_interest[%d]: want %q, got %q", i, want[i], got[i])
+		}
+	}
 }

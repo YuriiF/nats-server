@@ -5562,15 +5562,13 @@ sendToRoutesOrLeafs:
 	}
 
 	// "_LR_" leaf reply: when forwarding a local client's request across a leaf
-	// node, advertise the inbox reply under this server's compact reply prefix
-	// (the original inbox is appended after it) so per-inbox interest does not
-	// need to propagate. Computed once since the prefix is per-server.
+	// node, advertise the reply under this server's compact reply prefix (the
+	// original subject is appended after it) so per-subject interest does not
+	// need to propagate. Eligibility is per-connection; the rewritten bytes are
+	// the same for every leaf target (this server's prefix), so build lazily once.
+	maybeLeafReply := len(reply) > 0 && c.kind == CLIENT && c.srv.leafNodeReplySupported()
 	var leafReplya [256]byte
 	var leafReply []byte
-	if len(reply) > 0 && c.kind == CLIENT && c.srv.leafNodeReplyEnabled() && isInboxSubject(reply) {
-		leafReply = append(leafReplya[:0], c.srv.lrReplyPfx...)
-		leafReply = append(leafReply, reply...)
-	}
 
 	// Copy off original pa in case it changes.
 	pa := c.pa
@@ -5619,9 +5617,15 @@ sendToRoutesOrLeafs:
 			hset = true
 		}
 
-		// For leaf destinations, use the compacted "_LR_" reply if applicable.
+		// For leaf destinations, use the compacted "_LR_" reply when this
+		// connection has it enabled and the reply matches an eligible pattern.
 		rpl := reply
-		if leafReply != nil && dc.kind == LEAF {
+		if maybeLeafReply && dc.kind == LEAF && dc.leaf.lrEnabled &&
+			dc.leaf.lrEligible != nil && dc.leaf.lrEligible.HasInterest(string(reply)) {
+			if leafReply == nil {
+				leafReply = append(leafReplya[:0], c.srv.lrReplyPfx...)
+				leafReply = append(leafReply, reply...)
+			}
 			rpl = leafReply
 		}
 		mh := c.msgHeaderForRouteOrLeaf(subject, rpl, rt, acc)

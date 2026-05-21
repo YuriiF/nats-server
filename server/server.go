@@ -160,6 +160,7 @@ type Info struct {
 
 	// LeafNode Specific
 	LeafNodeURLs []string `json:"leafnode_urls,omitempty"` // LeafNode URLs that the server can reconnect to.
+	LR           bool     `json:"lr,omitempty"`            // Server supports the "_LR_" leaf reply (interest compaction) mechanism.
 
 	XKey string `json:"xkey,omitempty"` // Public server's x25519 key.
 }
@@ -271,10 +272,10 @@ type Server struct {
 	gatewayListenerErr error
 	gateway            *srvGateway
 
-	// For the "_LR_" leaf reply mechanism (LeafNode.CompactInboxInterest).
-	// Set once at startup and read-only afterwards.
-	lrReplyPfx      []byte // "_LR_.<srvHash>." or nil when disabled
+	// For the "_LR_" leaf reply mechanism. Set once at startup, read-only after.
+	lrReplyPfx      []byte // "_LR_.<srvHash>."
 	lrReplyWildcard string // "_LR_.<srvHash>.>"
+	lrSupported     bool   // whether this server advertises/participates in _LR_
 
 	// Used by tests to check that http.Servers do
 	// not set any timeout.
@@ -868,13 +869,17 @@ func NewServer(opts *Options) (*Server, error) {
 		return nil, err
 	}
 
-	// Initialize the "_LR_" leaf reply prefix used to compact inbox interest
-	// across leaf nodes. The per-server hash lets a reply route back to the
-	// one originating server, mirroring the gateway "_GR_" reply prefix.
-	if opts.LeafNode.CompactInboxInterest {
+	// Initialize the "_LR_" leaf reply prefix used to compact interest across
+	// leaf nodes. The per-server hash lets a reply route back to the one
+	// originating server, mirroring the gateway "_GR_" reply prefix. The prefix
+	// is always computed; participation is gated by lrSupported (default on,
+	// disabled via LeafNode.NoCompactInterest) and per-connection capability
+	// negotiation.
+	{
 		h := getHashSize(s.info.ID, leafReplyHashLen)
 		s.lrReplyPfx = []byte(leafReplyPrefix + h + ".")
 		s.lrReplyWildcard = leafReplyPrefix + h + ".>"
+		s.lrSupported = !opts.LeafNode.NoCompactInterest
 	}
 
 	// If we have a cluster definition but do not have a cluster name, create one.
