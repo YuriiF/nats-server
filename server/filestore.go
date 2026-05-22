@@ -373,6 +373,10 @@ const (
 	rlBadThresh = 32 * 1024 * 1024
 	// Checksum size for hash for msg records.
 	recordHashSize = 8
+
+	// Above this number of subjects, index.db may not be written regularly anymore, and
+	// certain psim optimisations may not be used.
+	highCardinalityThreshold = 1_000_000
 )
 
 func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
@@ -3272,6 +3276,9 @@ func (fs *fileStore) checkSkipFirstBlock(filter string, wc bool, bi int) (int, e
 	// Move through psim to gather start and stop bounds.
 	start, stop := uint32(math.MaxUint32), uint32(0)
 	if wc {
+		if fs.psim.Size() > highCardinalityThreshold {
+			return bi + 1, nil
+		}
 		fs.psim.Match(stringToBytes(filter), func(_ []byte, psi *psi) {
 			if psi.fblk < start {
 				start = psi.fblk
@@ -3294,7 +3301,7 @@ func (fs *fileStore) checkSkipFirstBlock(filter string, wc bool, bi int) (int, e
 // Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
 func (fs *fileStore) checkSkipFirstBlockMulti(sl *gsl.SimpleSublist, bi int) (int, error) {
 	// Don't bother if full wildcard.
-	if sl.MatchesFullWildcard() {
+	if sl.MatchesFullWildcard() || fs.psim.Size() > highCardinalityThreshold {
 		return bi + 1, nil
 	}
 	// Move through psim to gather start and stop bounds.
@@ -10704,13 +10711,12 @@ func (fs *fileStore) _writeFullState(force, needLock bool) error {
 	// We will base off of number of subjects and interior deletes. A very large number of msg blocks could also
 	// be used, but for next server version will redo all meta handling to be disk based. So this is temporary.
 	if !force {
-		const numThreshold = 1_000_000
 		// Calculate interior deletes.
 		var numDeleted int
 		if fs.state.LastSeq > fs.state.FirstSeq {
 			numDeleted = int((fs.state.LastSeq - fs.state.FirstSeq + 1) - fs.state.Msgs)
 		}
-		if numSubjects > numThreshold || numDeleted > numThreshold {
+		if numSubjects > highCardinalityThreshold || numDeleted > highCardinalityThreshold {
 			fsUnlock()
 			return errStateTooBig
 		}

@@ -12094,6 +12094,67 @@ func TestFileStoreLoadNextMsgMultiSkipAhead(t *testing.T) {
 	}
 }
 
+func BenchmarkFileStoreCheckSkipFirstBlockMultiTippingPoint(b *testing.B) {
+	if testing.Short() {
+		b.Skip("performance-oriented benchmark")
+	}
+
+	start := uint64(2)
+	cases := []int{1_000, 10_000, 100_000, 500_000, 1_000_000, 1_500_000, 2_000_000}
+	const fillerBlocks = 4096
+	const totalMsgs = 4_000_000
+	msg := []byte("ok")
+
+	for _, uniqueSubjects := range cases {
+		b.Run(fmt.Sprintf("UniqueSubjects/%d", uniqueSubjects), func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{
+					StoreDir:  b.TempDir(),
+					BlockSize: 1 << 20,
+				},
+				StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer func() { _ = fs.Stop() }()
+
+			for i := range fillerBlocks {
+				_, _, err = fs.StoreMsg("foo.fill", nil, msg, 0)
+				require_NoError(b, err)
+				if i < fillerBlocks-1 {
+					_, err = fs.newMsgBlockForWrite()
+					require_NoError(b, err)
+				}
+			}
+
+			matchingMsgs := totalMsgs - fillerBlocks
+			for i := range matchingMsgs {
+				subj := fmt.Sprintf("foo.%d.bar", i%uniqueSubjects)
+				_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+				require_NoError(b, err)
+			}
+
+			sl := gsl.NewSublist[struct{}]()
+			require_NoError(b, sl.Insert("foo.*.bar", struct{}{}))
+			require_NoError(b, sl.Insert("zzz.nope", struct{}{}))
+
+			var sm StoreMsg
+			_, _, err = fs.LoadNextMsgMulti(sl, start, &sm)
+			require_NoError(b, err)
+
+			fs.mu.RLock()
+			psimSize := fs.psim.Size()
+			fs.mu.RUnlock()
+
+			b.ReportMetric(float64(psimSize), "psim")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, err = fs.LoadNextMsgMulti(sl, start, &sm)
+				require_NoError(b, err)
+			}
+		})
+	}
+}
+
 func TestFileStoreTrailingSkipMsgsFromStreamStateFile(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		cfg := StreamConfig{Name: "zzz", Storage: FileStorage, Subjects: []string{">"}}
