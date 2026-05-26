@@ -1800,6 +1800,27 @@ func TestJetStreamJWTClusterAccountNRG(t *testing.T) {
 			}
 			s.rnMu.Unlock()
 
+			// The Raft nodes move to the new traffic account asynchronously,
+			// once statsz has propagated every peer's account-NRG capability,
+			// so wait for them to converge before checking.
+			checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+				for _, rg := range raftNodes {
+					rg.Lock()
+					rgAcc := rg.acc
+					rg.Unlock()
+					want := syspub
+					if state == "owner" {
+						want = aExpPub
+					} else if state == thirdAcc {
+						want = aExpPub2
+					}
+					if rgAcc.Name != want {
+						return fmt.Errorf("group %q: traffic account is %q, want %q", rg.group, rgAcc.Name, want)
+					}
+				}
+				return nil
+			})
+
 			// Get the Raftz state also.
 			rz := s.Raftz(&RaftzOptions{AccountFilter: aExpPub})
 			require_NotNil(t, rz)
