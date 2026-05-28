@@ -4219,6 +4219,7 @@ func (mset *stream) skipBatchIfRecovering(batch *batchApply, buf []byte) (bool, 
 func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isRecovering bool, needLock bool) error {
 	s := js.srv
 
+	assert.Sometimes(op == compressedStreamMsgOp, "applyStreamMsgOp compressedStreamMsgOp", nil)
 	if op == compressedStreamMsgOp {
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
@@ -10401,6 +10402,7 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 		return lseq, nil
 	}
 
+	assert.Sometimes(op == compressedStreamMsgOp, "processCatchupMsg compressedStreamMsgOp", nil)
 	if op == compressedStreamMsgOp {
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
