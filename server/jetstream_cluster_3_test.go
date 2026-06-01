@@ -9042,3 +9042,235 @@ func TestJetStreamClusterMirrorSkipMsgsPropagatesProposeFailure(t *testing.T) {
 	mset.mu.Unlock()
 	require_Error(t, err, errNotLeader)
 }
+
+func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R7S", 7)
+	defer c.shutdown()
+
+	// Connect to the meta leader, it is guaranteed to remain running.
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 5,
+	})
+	require_NoError(t, err)
+
+	// Map peer IDs to servers.
+	peerSrv := make(map[string]*Server, len(c.servers))
+	srvPeer := make(map[*Server]string, len(c.servers))
+	for _, s := range c.servers {
+		peerSrv[s.Node()] = s
+		srvPeer[s] = s.Node()
+	}
+
+	// Get the stream peer set from the meta leader.
+	mjs := ml.getJetStream()
+	mjs.mu.RLock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	var streamPeers []string
+	if sa != nil {
+		streamPeers = copyStrings(sa.Group.Peers)
+	}
+	mjs.mu.RUnlock()
+	require_Len(t, len(streamPeers), 5)
+
+	// Shut down three of the stream's peers. Only two of the five stream peers remain online.
+	sl := c.streamLeader(globalAccountName, "TEST")
+	var offline []*Server
+	for _, p := range streamPeers {
+		if len(offline) == 3 {
+			break
+		}
+		if s := peerSrv[p]; s != sl && s != ml {
+			offline = append(offline, s)
+		}
+	}
+	require_Len(t, len(offline), 3)
+	for _, s := range offline {
+		s.Shutdown()
+	}
+
+	// Wait for the meta leader to mark the stopped servers as offline.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range offline {
+			if ni, ok := ml.nodeToInfo.Load(srvPeer[s]); !ok || !ni.(nodeInfo).offline {
+				return fmt.Errorf("server %q not marked offline yet", s.Name())
+			}
+		}
+		return nil
+	})
+
+	// Scale the stream down to R3. Only two of the five peers are online, but
+	// the stream must still end up with the requested number of replicas.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Wait for the scale down to be applied in the meta layer.
+	var newPeers []string
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		if sa == nil {
+			return fmt.Errorf("stream assignment not found")
+		}
+		if len(sa.Group.Peers) == len(streamPeers) {
+			return fmt.Errorf("scale down not applied yet, still %d peers", len(sa.Group.Peers))
+		}
+		newPeers = copyStrings(sa.Group.Peers)
+		return nil
+	})
+
+	// The stream peer set must reflect the requested replica count.
+	require_Len(t, len(newPeers), 3)
+
+	// The online peers must be preferred and part of the new peer set.
+	for _, p := range streamPeers {
+		if slices.Contains(offline, peerSrv[p]) {
+			continue
+		}
+		if !slices.Contains(newPeers, p) {
+			t.Fatalf("Online peer %q not selected by the scale down", peerSrv[p].Name())
+		}
+	}
+}
+
+func TestJetStreamClusterConsumerScaleDownPrefersOnlinePeers(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 5,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "DUR",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  5,
+	})
+	require_NoError(t, err)
+
+	// Map peer IDs to servers.
+	peerSrv := make(map[string]*Server, len(c.servers))
+	srvPeer := make(map[*Server]string, len(c.servers))
+	for _, s := range c.servers {
+		peerSrv[s.Node()] = s
+		srvPeer[s] = s.Node()
+	}
+
+	// Get the consumer peer set, in order, from the meta leader.
+	c.waitOnLeader()
+	ml := c.leader()
+	mjs := ml.getJetStream()
+	mjs.mu.RLock()
+	ca := mjs.consumerAssignment(globalAccountName, "TEST", "DUR")
+	var consumerPeers []string
+	if ca != nil {
+		consumerPeers = copyStrings(ca.Group.Peers)
+	}
+	mjs.mu.RUnlock()
+	require_Len(t, len(consumerPeers), 5)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "DUR")
+	require_NotNil(t, cl)
+	leaderPeer := srvPeer[cl]
+
+	// Simulate which peers the old scale down to R3 would keep: the current
+	// leader is moved to the end of the peer list, and the last three peers
+	// of the list are kept.
+	sim := copyStrings(consumerPeers)
+	for i, p := range sim {
+		if p == leaderPeer {
+			sim[i] = sim[len(sim)-1]
+			sim[len(sim)-1] = p
+		}
+	}
+	keep := sim[len(sim)-3:]
+	require_Equal(t, keep[2], leaderPeer)
+
+	// Reconnect the client to the consumer leader, it remains running.
+	nc.Close()
+	nc, js = jsClientConnect(t, cl)
+	defer nc.Close()
+
+	// Shut down the two non-leader peers that the scale down will keep. The
+	// other two peers, as well as the consumer leader, remain online.
+	var offline []*Server
+	for _, p := range keep[:2] {
+		s := peerSrv[p]
+		require_True(t, s != cl)
+		s.Shutdown()
+		offline = append(offline, s)
+	}
+	require_Len(t, len(offline), 2)
+
+	// The meta leader might have been shut down, wait for a new one.
+	c.waitOnLeader()
+	ml = c.leader()
+
+	// Wait for the meta leader to mark the stopped servers as offline.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range offline {
+			if ni, ok := ml.nodeToInfo.Load(srvPeer[s]); !ok || !ni.(nodeInfo).offline {
+				return fmt.Errorf("server %q not marked offline yet", s.Name())
+			}
+		}
+		return nil
+	})
+
+	// The consumer kept quorum (3 of 5 peers online), the leader must not
+	// have changed.
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "DUR")
+	require_Equal(t, c.consumerLeader(globalAccountName, "TEST", "DUR").Name(), cl.Name())
+
+	// Scale the consumer down to R3. The consumer leader and two more peers
+	// are online, so the scale down must select those peers and not the
+	// offline ones.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "DUR",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	// Wait for the scale down to be applied in the meta layer.
+	mjs = ml.getJetStream()
+	var newPeers []string
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		ca := mjs.consumerAssignment(globalAccountName, "TEST", "DUR")
+		if ca == nil {
+			return fmt.Errorf("consumer assignment not found")
+		}
+		if len(ca.Group.Peers) != 3 {
+			return fmt.Errorf("scale down not applied yet, still %d peers", len(ca.Group.Peers))
+		}
+		newPeers = copyStrings(ca.Group.Peers)
+		return nil
+	})
+
+	// The leader must have been preserved.
+	require_True(t, slices.Contains(newPeers, leaderPeer))
+
+	// The new peer set must consist of online peers only.
+	for _, s := range offline {
+		if slices.Contains(newPeers, srvPeer[s]) {
+			t.Fatalf("Scale down selected offline peer %q over online peers", s.Name())
+		}
+	}
+}
