@@ -1030,7 +1030,7 @@ func (js *jetStream) setupMetaGroup() error {
 	cfg.Observer = s.canExtendOtherDomain() && s.getOpts().JetStreamExtHint != jsNoExtend
 
 	var bootstrap bool
-	if ps, err := readPeerState(storeDir); err != nil {
+	if ps, err := readPeerState(s.diskIOSemaphore(), storeDir); err != nil {
 		s.Noticef("JetStream cluster bootstrapping")
 		bootstrap = true
 		peers := s.ActivePeers()
@@ -1064,7 +1064,7 @@ func (js *jetStream) setupMetaGroup() error {
 			// To track possible configuration changes, responsible for an altered value of cfg.Observer,
 			// set extension state to undetermined.
 			ps.domainExt = extUndetermined
-			if err := writePeerState(storeDir, ps); err != nil {
+			if err := writePeerState(s.diskIOSemaphore(), storeDir, ps); err != nil {
 				return err
 			}
 		}
@@ -2933,7 +2933,7 @@ retry:
 
 		cfg := &RaftConfig{Name: rgName, Store: storeDir, Log: store, Track: true, Recovering: recovering, ScaleUp: rgScaleUp}
 
-		if _, err := readPeerState(storeDir); err != nil {
+		if _, err := readPeerState(s.diskIOSemaphore(), storeDir); err != nil {
 			s.bootstrapRaftNode(cfg, rgPeers, true)
 		}
 
