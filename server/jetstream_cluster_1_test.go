@@ -4938,6 +4938,91 @@ func TestJetStreamClusterStreamRemovePeer(t *testing.T) {
 	require_True(t, rpResp.Success)
 }
 
+func TestJetStreamClusterStreamRemovePeerR1MovesData(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	msg, toSend := []byte("Hello JS Clustering"), 100
+	for range toSend {
+		_, err = js.Publish("foo", msg)
+		require_NoError(t, err)
+	}
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "dur", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	toRemove := si.Cluster.Leader
+
+	// Remove the only peer hosting the R1 stream. The data must move to the
+	// replacement peer before the old peer is released.
+	req := &JSApiStreamRemovePeerRequest{Peer: toRemove}
+	jsreq, err := json.Marshal(req)
+	require_NoError(t, err)
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), jsreq, time.Second)
+	require_NoError(t, err)
+	var rpResp JSApiStreamRemovePeerResponse
+	require_NoError(t, json.Unmarshal(resp.Data, &rpResp))
+	require_True(t, rpResp.Success)
+
+	// Wait for the stream and consumer to fully move off the removed peer, back to R1, with all data intact.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		// Stream info.
+		si, err := streamInfo(t, nc, "TEST")
+		if err != nil {
+			return fmt.Errorf("could not fetch stream info: %v", err)
+		}
+		if si.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("no leader yet")
+		}
+		if si.Cluster.Leader == toRemove {
+			return fmt.Errorf("peer not removed yet: %v", toRemove)
+		}
+		if len(si.Cluster.Replicas) != 0 {
+			return fmt.Errorf("expected no replicas, got %d", len(si.Cluster.Replicas))
+		}
+		if si.State.Msgs != uint64(toSend) {
+			return fmt.Errorf("expected %d msgs, got %d", toSend, si.State.Msgs)
+		}
+		if si.Cluster.Desired != nil {
+			return fmt.Errorf("stream is still moving")
+		}
+
+		// Consumer info.
+		ci, err := consumerInfo(t, nc, "TEST", "dur")
+		if err != nil {
+			return fmt.Errorf("could not fetch consumer info: %v", err)
+		}
+		if ci.Cluster.Leader == toRemove {
+			return fmt.Errorf("consumer peer not removed yet: %v", toRemove)
+		}
+		if ci.NumPending != uint64(toSend) {
+			return fmt.Errorf("expected %d pending, got %d", toSend, ci.NumPending)
+		}
+		if ci.Cluster.Desired != nil {
+			return fmt.Errorf("consumer is still moving")
+		}
+		return nil
+	})
+
+	pullSub, err := js.PullSubscribe("foo", "dur")
+	require_NoError(t, err)
+	msgs, err := pullSub.Fetch(toSend, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Equal(t, len(msgs), toSend)
+}
+
 func TestJetStreamClusterStreamLeaderStepDown(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "RNS", 3)
 	defer c.shutdown()

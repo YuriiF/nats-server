@@ -1921,6 +1921,23 @@ func streamInfo(t *testing.T, nc *nats.Conn, stream string) (*StreamInfo, error)
 	return resp.StreamInfo, nil
 }
 
+func consumerInfo(t *testing.T, nc *nats.Conn, stream, consumer string) (*ConsumerInfo, error) {
+	t.Helper()
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiConsumerInfoT, stream, consumer), nil, 500*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	var resp JSApiConsumerInfoResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+	if resp.Type != JSApiConsumerInfoResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiConsumerInfoResponseType)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	return resp.ConsumerInfo, nil
+}
+
 // setInActiveDeleteThreshold sets the delete threshold for how long to wait
 // before deleting an inactive consumer.
 func (o *consumer) setInActiveDeleteThreshold(dthresh time.Duration) error {

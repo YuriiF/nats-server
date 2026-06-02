@@ -179,6 +179,25 @@ type desiredGroupPlacement struct {
 	Group     *raftGroup `json:"group,omitempty"`
 }
 
+// withDesired returns a copy of rg with target expressed as the desired state.
+func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
+	dg := target.copyGroup()
+	dg.Desired = nil // leaf invariant: desired groups never nest
+	// When scaling up from a single replica, set it as preferred, as it has the data.
+	if len(rg.Peers) == 1 {
+		dg.Preferred = rg.Peers[0]
+	} else if dg.Preferred != _EMPTY_ && !slices.Contains(dg.Peers, dg.Preferred) {
+		// Don't carry a stale preferred into the desired group.
+		dg.Preferred = _EMPTY_
+	}
+	ng := rg.copyGroup()
+	ng.Desired = &desiredGroupPlacement{
+		ID:    nuid.Next(),
+		Group: dg,
+	}
+	return ng
+}
+
 // streamAssignment is what the meta controller uses to assign streams to peers.
 type streamAssignment struct {
 	Client     *ClientInfo     `json:"client,omitempty"`
@@ -2574,26 +2593,6 @@ func (js *jetStream) removePeerFromStream(sa *streamAssignment, peer string) boo
 	return js.removePeerFromStreamLocked(sa, peer)
 }
 
-// populateConsumerWithDesired takes cca, whose group holds the consumer's target
-// peer set, and rewrites it so that the current group is preserved from ca and the
-// target peer set is expressed as the desired state instead.
-func populateConsumerWithDesired(ca, cca *consumerAssignment) {
-	desiredGroup := cca.Group
-	desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-	// When scaling up from a single replica, set it as preferred, as it has the data.
-	if len(ca.Group.Peers) == 1 {
-		desiredGroup.Preferred = ca.Group.Peers[0]
-	} else if desiredGroup.Preferred != _EMPTY_ && !slices.Contains(desiredGroup.Peers, desiredGroup.Preferred) {
-		// Don't carry a stale preferred into the desired group.
-		desiredGroup.Preferred = _EMPTY_
-	}
-	cca.Group = ca.Group.copyGroup()
-	cca.Group.Desired = &desiredGroupPlacement{
-		ID:    nuid.Next(),
-		Group: desiredGroup,
-	}
-}
-
 // Lock should be held.
 func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string) bool {
 	if rg := sa.Group; !rg.isCurrentMember(peer) {
@@ -2616,9 +2615,11 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	// membership: the stream leader converges the group toward the desired set
 	// (EntryAddPeer/EntryRemovePeer) and the meta leader promotes the assignment
 	// once the actual placement matches it.
+	//
+	// Use move semantics (withDesired) to prioritize moving data safely over
+	// evicting the peer immediately: for R1 the removed peer stays preferred so
+	// it leads the transitional group until the replacement has caught up.
 	desiredGroup := csa.Group
-	desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-	desiredGroup.Preferred = _EMPTY_
 	// Base the desired placement on any in-flight desired state so a peer-remove
 	// does not drop the placement intent of a move/scale that's underway. Without
 	// one, carry the stream's current placement so promotion keeps it unchanged.
@@ -2629,11 +2630,8 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	csa = sa.copyGroup()
 	// Remove the original reply, since this change is internal.
 	csa.Reply = _EMPTY_
-	csa.Group.Desired = &desiredGroupPlacement{
-		ID:        nuid.Next(),
-		Placement: placement,
-		Group:     desiredGroup,
-	}
+	csa.Group = sa.Group.withDesired(desiredGroup)
+	csa.Group.Desired.Placement = placement
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
 	if err := cc.meta.Propose(encodeUpdateStreamAssignment(csa)); err != nil {
@@ -2649,7 +2647,7 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 		if ca.Config.Durable != _EMPTY_ {
 			cca := ca.copyGroup()
 			cca.Group.Peers, cca.Group.Preferred = targetPeers, _EMPTY_
-			populateConsumerWithDesired(ca, cca)
+			cca.Group = ca.Group.withDesired(cca.Group)
 			if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err == nil {
 				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 			}
@@ -8889,7 +8887,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					cca.Config.Replicas = len(rg.Peers)
 				}
 
-				populateConsumerWithDesired(ca, cca)
+				cca.Group = ca.Group.withDesired(cca.Group)
 
 				// We can not propose here before the stream itself so we collect them.
 				consumers = append(consumers, cca)
@@ -8937,7 +8935,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 						cca.Config.Replicas = len(newPeers)
 					}
 
-					populateConsumerWithDesired(ca, cca)
+					cca.Group = ca.Group.withDesired(cca.Group)
 
 					// We can not propose here before the stream itself so we collect them.
 					consumers = append(consumers, cca)
@@ -8988,7 +8986,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			} else {
 				cca.Group.Peers = append(dropPeerSet, cPeerSet...)
 			}
-			populateConsumerWithDesired(ca, cca)
+			cca.Group = ca.Group.withDesired(cca.Group)
 
 			// make sure it overlaps with peers and remove if not
 			if cca.Group.Preferred != _EMPTY_ {
@@ -9013,13 +9011,8 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	sa := &streamAssignment{Group: osa.Group, Sync: syncSubject, Created: osa.Created, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
 	if isMoveRequest || isReplicaChange {
 		// Set the desired state.
-		rg.Desired = nil // leaf invariant: desired groups never nest
-		sa.Group = osa.Group.copyGroup()
-		sa.Group.Desired = &desiredGroupPlacement{
-			ID:        nuid.Next(),
-			Placement: newCfg.Placement,
-			Group:     rg,
-		}
+		sa.Group = osa.Group.withDesired(rg)
+		sa.Group.Desired.Placement = newCfg.Placement
 		// Keep the current placement unchanged, the desired state contains the new placement.
 		newCfg.Placement = osa.Config.Placement
 	}
@@ -10133,13 +10126,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 
 		if rBefore != rAfter {
-			desiredGroup := nca.Group
-			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-			nca.Group = ca.Group.copyGroup()
-			nca.Group.Desired = &desiredGroupPlacement{
-				ID:    nuid.Next(),
-				Group: desiredGroup,
-			}
+			nca.Group = ca.Group.withDesired(nca.Group)
 		}
 		ca = nca
 	}
