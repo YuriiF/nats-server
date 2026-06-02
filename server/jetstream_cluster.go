@@ -8816,15 +8816,21 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 		// Need to remap any consumers.
 		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, osa.Config.Name) {
+			// The consumer's target peer set. If the consumer itself has a scale or move
+			// inflight, we must remap against where it is headed, not where it currently is.
+			targetPeers := ca.Group.Peers
+			if d := ca.Group.Desired; d != nil && d.Group != nil {
+				targetPeers = d.Group.Peers
+			}
 			// Legacy ephemerals are R=1 but present as R=0, so only auto-remap named consumers, or if we are downsizing the consumer peers.
 			// If stream is interest or workqueue policy always remaps since they require peer parity with stream.
-			numPeers := len(ca.Group.Peers)
+			numPeers := len(targetPeers)
 			isAutoScale := ca.Config.Replicas == 0 && (ca.Config.Durable != _EMPTY_ || ca.Config.Name != _EMPTY_)
 			if isAutoScale || numPeers > len(rg.Peers) || cfg.Retention != LimitsPolicy {
 				cca := ca.copyGroup()
 				// Adjust preferred as needed.
 				if numPeers == 1 && isScaleUp {
-					cca.Group.Preferred = ca.Group.Peers[0]
+					cca.Group.Preferred = targetPeers[0]
 				} else {
 					cca.Group.Preferred = _EMPTY_
 				}
@@ -8848,19 +8854,32 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				// We decided to leave this consumer's peer group alone but we are also scaling down.
 				// We need to make sure we do not have any peers that are no longer part of the stream.
 				// Note we handle down scaling of a consumer above if its number of peers were > new stream peers.
-				var needReplace []string
-				for _, rp := range ca.Group.Peers {
+				var needReplace bool
+				for _, rp := range targetPeers {
 					// Check if we have an orphaned peer now for this consumer.
 					if !rg.isCurrentMember(rp) {
-						needReplace = append(needReplace, rp)
+						needReplace = true
+						break
 					}
 				}
-				if len(needReplace) > 0 {
-					newPeers := copyStrings(rg.Peers)
-					rand.Shuffle(len(newPeers), func(i, j int) { newPeers[i], newPeers[j] = newPeers[j], newPeers[i] })
-					// If we had a small size then the peer set, restrict to the same number.
-					if lp := len(ca.Group.Peers); lp < len(newPeers) {
-						newPeers = newPeers[:lp]
+				if needReplace {
+					// Keep target peers that remain part of the stream, and replace the
+					// orphaned ones with new stream peers.
+					newPeers := make([]string, 0, numPeers)
+					for _, rp := range targetPeers {
+						if rg.isCurrentMember(rp) {
+							newPeers = append(newPeers, rp)
+						}
+					}
+					fill := copyStrings(rg.Peers)
+					rand.Shuffle(len(fill), func(i, j int) { fill[i], fill[j] = fill[j], fill[i] })
+					for _, p := range fill {
+						if len(newPeers) == numPeers {
+							break
+						}
+						if !slices.Contains(newPeers, p) {
+							newPeers = append(newPeers, p)
+						}
 					}
 					cca := ca.copyGroup()
 					// Assign new peers.

@@ -11187,3 +11187,173 @@ func TestJetStreamClusterR1ConsumerOfflineDuringStreamScaleDown(t *testing.T) {
 		require_NoError(t, m.AckSync())
 	}
 }
+
+func TestJetStreamClusterStreamScaleDownDuringConsumerScaleDown(t *testing.T) {
+	test := func(t *testing.T, streamReplicas int) {
+		c := createJetStreamClusterExplicit(t, "R5S", 5)
+		defer c.shutdown()
+
+		// Connect to the meta leader, it is guaranteed to remain running.
+		ml := c.leader()
+		nc, js := jsClientConnect(t, ml)
+		defer nc.Close()
+
+		// R5 stream.
+		scfg := &nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: 5,
+		}
+		_, err := js.AddStream(scfg)
+		require_NoError(t, err)
+
+		// Publish a batch of messages.
+		const total = 10
+		for range total {
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+		}
+
+		// R5 durable pull consumer.
+		ccfg := &nats.ConsumerConfig{
+			Durable:   "C",
+			AckPolicy: nats.AckExplicitPolicy,
+			Replicas:  5,
+		}
+		_, err = js.AddConsumer("TEST", ccfg)
+		require_NoError(t, err)
+
+		// Make sure the stream and consumer leaders live on different servers, the
+		// stream and consumer scale downs below will then each try to preserve a
+		// different peer.
+		checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+			sl := c.streamLeader(globalAccountName, "TEST")
+			cl := c.consumerLeader(globalAccountName, "TEST", "C")
+			if sl == nil || cl == nil {
+				return fmt.Errorf("missing leader (stream=%v, consumer=%v)", sl, cl)
+			}
+			if sl == cl {
+				// Move the consumer leader off of the stream leader's server.
+				if _, err := nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "C"), nil, time.Second); err != nil {
+					return err
+				}
+				c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+				return fmt.Errorf("stream and consumer leader still co-located")
+			}
+			return nil
+		})
+
+		sl := c.streamLeader(globalAccountName, "TEST")
+		cl := c.consumerLeader(globalAccountName, "TEST", "C")
+		require_NotEqual(t, sl, cl)
+
+		// Consume and ack half of the messages so the consumer has state to preserve.
+		const acked = 5
+		sub, err := js.PullSubscribe("foo", "C", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		msgs, err := sub.Fetch(acked, nats.MaxWait(5*time.Second))
+		require_NoError(t, err)
+		require_Equal(t, len(msgs), acked)
+		for _, m := range msgs {
+			require_NoError(t, m.AckSync())
+		}
+
+		// Scale the consumer down from R5 to R1. This keeps the consumer leader and
+		// removes one peer at a time, so it stays inflight for a while.
+		ccfg.Replicas = 1
+		_, err = js.UpdateConsumer("TEST", ccfg)
+		require_NoError(t, err)
+
+		// Wait for the consumer scale down to be partially complete: some peers have
+		// already been removed from the consumer's raft group, but the scale down is
+		// still inflight (desired state still set).
+		mjs := ml.getJetStream()
+		checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
+			mjs.mu.RLock()
+			defer mjs.mu.RUnlock()
+			ca := mjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C")
+			if ca == nil || ca.Group == nil {
+				return fmt.Errorf("no consumer assignment")
+			}
+			// If the scale down fully completed already we can no longer interleave
+			// the stream scale down with it, so the test would not exercise anything.
+			if ca.Group.Desired == nil {
+				t.Fatalf("consumer scale down completed before the stream scale down could be issued")
+			}
+			if npeers := len(ca.Group.Peers); npeers > 3 {
+				return fmt.Errorf("consumer scale down not far enough along, still %d peers", npeers)
+			}
+			return nil
+		})
+
+		// While the consumer scale down is inflight, scale the stream down too.
+		scfg.Replicas = streamReplicas
+		_, err = js.UpdateStream(scfg)
+		require_NoError(t, err)
+
+		// Wait for everything to settle, the meta layer must agree:
+		//  - the stream has the requested number of replicas,
+		//  - the consumer is still R1, the inflight consumer scale down must not be
+		//    reverted/upsized by the stream scale down,
+		//  - the consumer's peer is part of the stream's peer set,
+		//  - no desired state is left dangling.
+		checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+			mjs.mu.RLock()
+			defer mjs.mu.RUnlock()
+			sa := mjs.streamAssignment(globalAccountName, "TEST")
+			ca := mjs.consumerAssignment(globalAccountName, "TEST", "C")
+			if sa == nil || sa.Group == nil {
+				return fmt.Errorf("no stream assignment")
+			}
+			if ca == nil || ca.Group == nil {
+				return fmt.Errorf("no consumer assignment")
+			}
+			if sa.Group.Desired != nil {
+				return fmt.Errorf("stream still has desired state: %v", sa.Group.Desired.Group.Peers)
+			}
+			if ca.Group.Desired != nil {
+				return fmt.Errorf("consumer still has desired state: %v", ca.Group.Desired.Group.Peers)
+			}
+			if len(sa.Group.Peers) != streamReplicas {
+				return fmt.Errorf("stream has %d peers, expected %d", len(sa.Group.Peers), streamReplicas)
+			}
+			if len(ca.Group.Peers) != 1 {
+				return fmt.Errorf("consumer has %d peers, expected 1: %v", len(ca.Group.Peers), ca.Group.Peers)
+			}
+			if ca.Config.Replicas != 0 && ca.Config.Replicas != 1 {
+				return fmt.Errorf("consumer config has %d replicas, expected 1", ca.Config.Replicas)
+			}
+			for _, p := range ca.Group.Peers {
+				if !sa.Group.isCurrentMember(p) {
+					return fmt.Errorf("consumer peer %q is not a stream peer %v", p, sa.Group.Peers)
+				}
+			}
+			return nil
+		})
+
+		// The consumer must still report R1 and must not have lost its acked state.
+		ci, err := js.ConsumerInfo("TEST", "C")
+		require_NoError(t, err)
+		require_Equal(t, ci.Config.Replicas, 1)
+		require_Equal(t, ci.AckFloor.Consumer, acked)
+		require_Equal(t, ci.AckFloor.Stream, acked)
+		require_Equal(t, ci.NumPending, total-acked)
+
+		// Re-fetching must only deliver the un-acked remainder, never the messages
+		// we already acked.
+		sub, err = js.PullSubscribe("foo", "C", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		msgs, err = sub.Fetch(total-acked, nats.MaxWait(5*time.Second))
+		require_NoError(t, err)
+		require_Equal(t, len(msgs), total-acked)
+		for _, m := range msgs {
+			meta, err := m.Metadata()
+			require_NoError(t, err)
+			require_True(t, meta.Sequence.Stream > acked)
+			require_NoError(t, m.AckSync())
+		}
+	}
+
+	t.Run("stream-to-R1", func(t *testing.T) { test(t, 1) })
+	t.Run("stream-to-R3", func(t *testing.T) { test(t, 3) })
+}
