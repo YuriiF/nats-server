@@ -2574,6 +2574,26 @@ func (js *jetStream) removePeerFromStream(sa *streamAssignment, peer string) boo
 	return js.removePeerFromStreamLocked(sa, peer)
 }
 
+// populateConsumerWithDesired takes cca, whose group holds the consumer's target
+// peer set, and rewrites it so that the current group is preserved from ca and the
+// target peer set is expressed as the desired state instead.
+func populateConsumerWithDesired(ca, cca *consumerAssignment) {
+	desiredGroup := cca.Group
+	desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+	// When scaling up from a single replica, set it as preferred, as it has the data.
+	if len(ca.Group.Peers) == 1 {
+		desiredGroup.Preferred = ca.Group.Peers[0]
+	} else if desiredGroup.Preferred != _EMPTY_ && !slices.Contains(desiredGroup.Peers, desiredGroup.Preferred) {
+		// Don't carry a stale preferred into the desired group.
+		desiredGroup.Preferred = _EMPTY_
+	}
+	cca.Group = ca.Group.copyGroup()
+	cca.Group.Desired = &desiredGroupPlacement{
+		ID:    nuid.Next(),
+		Group: desiredGroup,
+	}
+}
+
 // Lock should be held.
 func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string) bool {
 	if rg := sa.Group; !rg.isCurrentMember(peer) {
@@ -2584,18 +2604,43 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	if cc == nil || cc.meta == nil {
 		return false
 	}
+	// Compute the target peer set on a scratch copy of the group.
 	replaced := cc.remapStreamAssignment(csa, peer)
 	accName := sa.Client.serviceAccount()
 	if !replaced {
 		s.Warnf("JetStream cluster could not replace peer for stream '%s > %s'", accName, sa.Config.Name)
 	}
 
+	// Express the remapped peer set as the desired state and keep the current
+	// peer set unchanged. The group's Raft log remains the source of truth for
+	// membership: the stream leader converges the group toward the desired set
+	// (EntryAddPeer/EntryRemovePeer) and the meta leader promotes the assignment
+	// once the actual placement matches it.
+	desiredGroup := csa.Group
+	desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+	desiredGroup.Preferred = _EMPTY_
+	// Base the desired placement on any in-flight desired state so a peer-remove
+	// does not drop the placement intent of a move/scale that's underway. Without
+	// one, carry the stream's current placement so promotion keeps it unchanged.
+	placement := sa.Config.Placement
+	if d := sa.Group.Desired; d != nil {
+		placement = d.Placement
+	}
+	csa = sa.copyGroup()
+	// Remove the original reply, since this change is internal.
+	csa.Reply = _EMPTY_
+	csa.Group.Desired = &desiredGroupPlacement{
+		ID:        nuid.Next(),
+		Placement: placement,
+		Group:     desiredGroup,
+	}
+
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
-	if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
+	if err := cc.meta.Propose(encodeUpdateStreamAssignment(csa)); err != nil {
 		return false
 	}
 	cc.trackInflightStreamProposal(accName, csa, false)
-	rg := csa.Group
+	targetPeers := desiredGroup.Peers
 	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
 		if ca.unsupported != nil {
 			continue
@@ -2603,7 +2648,8 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 		// Ephemerals are R=1, so only auto-remap durables, or R>1.
 		if ca.Config.Durable != _EMPTY_ {
 			cca := ca.copyGroup()
-			cca.Group.Peers, cca.Group.Preferred = rg.Peers, _EMPTY_
+			cca.Group.Peers, cca.Group.Preferred = targetPeers, _EMPTY_
+			populateConsumerWithDesired(ca, cca)
 			if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err == nil {
 				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 			}
@@ -8746,23 +8792,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Reset notion of scaling up, if this was done in a previous update.
 	rg.ScaleUp = false
-
-	populateConsumerWithDesired := func(ca, cca *consumerAssignment) {
-		desiredGroup := cca.Group
-		desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-		// When scaling up from a single replica, set it as preferred, as it has the data.
-		if len(ca.Group.Peers) == 1 {
-			desiredGroup.Preferred = ca.Group.Peers[0]
-		} else if desiredGroup.Preferred != _EMPTY_ && !slices.Contains(desiredGroup.Peers, desiredGroup.Preferred) {
-			// Don't carry a stale preferred into the desired group.
-			desiredGroup.Preferred = _EMPTY_
-		}
-		cca.Group = ca.Group.copyGroup()
-		cca.Group.Desired = &desiredGroupPlacement{
-			ID:    nuid.Next(),
-			Group: desiredGroup,
-		}
-	}
 
 	if isReplicaChange {
 		isScaleUp := newCfg.Replicas > len(rg.Peers)

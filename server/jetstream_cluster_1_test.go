@@ -3614,7 +3614,7 @@ func TestJetStreamClusterPeerRemovalAndStreamReassignment(t *testing.T) {
 		// We should not see the old server at all.
 		for _, p := range si.Cluster.Replicas {
 			if p.Name == toRemove {
-				t.Fatalf("Peer not removed yet: %+v", toRemove)
+				return fmt.Errorf("peer not removed yet: %+v", toRemove)
 			}
 			if !p.Current {
 				return fmt.Errorf("Expected replica to be current: %+v", p)
