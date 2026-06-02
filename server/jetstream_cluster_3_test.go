@@ -10858,6 +10858,8 @@ func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testin
 
 	// Shut down three of the stream's peers. Only two of the five stream peers remain online.
 	sl := c.streamLeader(globalAccountName, "TEST")
+	leaderPeer := srvPeer[sl]
+
 	var offline []*Server
 	for _, p := range streamPeers {
 		if len(offline) == 3 {
@@ -10882,7 +10884,8 @@ func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testin
 		return nil
 	})
 
-	// Scale the stream down to R3. Only two of the five peers are online, but
+	// Scale the stream down to R3. Only two of the five peers are online, so the scale
+	// down can't complete, but the assignment state should reflect it.
 	// the stream must still end up with the requested number of replicas.
 	_, err = js.UpdateStream(&nats.StreamConfig{
 		Name:     "TEST",
@@ -10891,34 +10894,25 @@ func TestJetStreamClusterStreamScaleDownOfflinePeersHonorsReplicaCount(t *testin
 	})
 	require_NoError(t, err)
 
-	// Wait for the scale down to be applied in the meta layer.
-	var newPeers []string
-	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
-		mjs.mu.RLock()
-		defer mjs.mu.RUnlock()
-		sa := mjs.streamAssignment(globalAccountName, "TEST")
-		if sa == nil {
-			return fmt.Errorf("stream assignment not found")
-		}
-		if len(sa.Group.Peers) == len(streamPeers) {
-			return fmt.Errorf("scale down not applied yet, still %d peers", len(sa.Group.Peers))
-		}
-		newPeers = copyStrings(sa.Group.Peers)
-		return nil
-	})
+	mjs.mu.RLock()
+	sa = mjs.streamAssignmentOrInflight(globalAccountName, "TEST")
+	var desiredPeers []string
+	if sa != nil && sa.Group != nil && sa.Group.Desired != nil {
+		desiredPeers = copyStrings(sa.Group.Desired.Group.Peers)
+	}
+	mjs.mu.RUnlock()
+	require_Len(t, len(desiredPeers), 3)
 
-	// The stream peer set must reflect the requested replica count.
-	require_Len(t, len(newPeers), 3)
+	// The leader must have been preserved.
+	require_True(t, slices.Contains(desiredPeers, leaderPeer))
 
-	// The online peers must be preferred and part of the new peer set.
-	for _, p := range streamPeers {
-		if slices.Contains(offline, peerSrv[p]) {
-			continue
-		}
-		if !slices.Contains(newPeers, p) {
-			t.Fatalf("Online peer %q not selected by the scale down", peerSrv[p].Name())
+	var selectedOffline int
+	for _, s := range offline {
+		if slices.Contains(desiredPeers, srvPeer[s]) {
+			selectedOffline++
 		}
 	}
+	require_Equal(t, selectedOffline, 1)
 }
 
 func TestJetStreamClusterConsumerScaleDownPrefersOnlinePeers(t *testing.T) {
