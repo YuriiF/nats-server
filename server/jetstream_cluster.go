@@ -2530,21 +2530,29 @@ func (js *jetStream) processAddPeer(peer string) {
 				continue
 			}
 			// If we are here we can add in this peer.
-			csa := sa.copyGroup()
-			// While a move/scale is inflight, the desired peer set is the target
-			// placement, so add the new peer there; adding it to the current peer
-			// set would be undone once the in-flight desired state is promoted.
-			// Refresh the desired ID so in-flight placement updates for the old
-			// target can't promote it prematurely.
-			var targetPeers []string
-			if d := csa.Group.Desired; d != nil && d.Group != nil {
-				d.Group.Peers = append(d.Group.Peers, peer)
-				d.ID = nuid.Next()
-				targetPeers = d.Group.Peers
+			// Compute the new target peer set. The addition is desired-aware: the new
+			// peer joins the peer set the group is converging toward, so it is not
+			// undone once an inflight desired state (move/scale underway) is promoted.
+			placement := sa.effectivePlacement()
+			var targetGroup *raftGroup
+			if d := sa.Group.Desired; d != nil && d.Group != nil {
+				targetGroup = d.Group.copyGroup()
 			} else {
-				csa.Group.Peers = append(csa.Group.Peers, peer)
-				targetPeers = csa.Group.Peers
+				targetGroup = sa.Group.copyGroup()
 			}
+			targetGroup.Peers = append(targetGroup.Peers, peer)
+			// Don't influence preferred leader.
+			targetGroup.Preferred = _EMPTY_
+
+			csa := sa.copyGroup()
+			// Express the expanded peer set as the desired state: the new peer must not
+			// become a current member before it has caught up. The stream leader converges
+			// the group toward the desired set and the meta leader promotes the assignment
+			// once the actual placement matches it. withDesired assigns a fresh ID, so
+			// inflight placement updates for an old target can't promote it prematurely.
+			csa.Group = sa.Group.withDesired(targetGroup)
+			csa.Group.Desired.Placement = placement
+			targetPeers := targetGroup.Peers
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
 			cc.meta.Propose(encodeAddStreamAssignment(csa))
 			cc.trackInflightStreamProposal(accName, csa, false)
@@ -2555,13 +2563,10 @@ func (js *jetStream) processAddPeer(peer string) {
 				// Ephemerals are R=1, so only auto-remap durables, or R>1.
 				if ca.Config.Durable != _EMPTY_ || len(ca.Group.Peers) > 1 {
 					cca := ca.copyGroup()
-					// Same as the stream above, track the target peer set.
-					if d := cca.Group.Desired; d != nil && d.Group != nil {
-						d.Group.Peers = copyStrings(targetPeers)
-						d.ID = nuid.Next()
-					} else {
-						cca.Group.Peers = copyStrings(targetPeers)
-					}
+					// Same as the stream above, express the target peer set as the
+					// consumer's desired state.
+					cca.Group.Peers, cca.Group.Preferred = copyStrings(targetPeers), _EMPTY_
+					cca.Group = ca.Group.withDesired(cca.Group)
 					cc.meta.Propose(encodeAddConsumerAssignment(cca))
 					cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 				}
