@@ -198,6 +198,17 @@ func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
 	return ng
 }
 
+// sameDesired returns whether rg and other express the same desired placement.
+// A desired placement's ID uniquely identifies it, including refreshes of the
+// same target peer set.
+func (rg *raftGroup) sameDesired(other *raftGroup) bool {
+	da, db := rg.Desired, other.Desired
+	if (da == nil) != (db == nil) {
+		return false
+	}
+	return da == nil || da.ID == db.ID
+}
+
 // streamAssignment is what the meta controller uses to assign streams to peers.
 type streamAssignment struct {
 	Client     *ClientInfo     `json:"client,omitempty"`
@@ -2474,9 +2485,16 @@ func (rg *raftGroup) copyGroup() *raftGroup {
 	return &cg
 }
 
+// missingPeers returns whether the assignment's target peer set has fewer peers
+// than the configured replica count. While a move/scale is inflight the desired
+// peer set is the target, otherwise the current peer set is.
 // Lock should be held.
 func (sa *streamAssignment) missingPeers() bool {
-	return len(sa.Group.Peers) < sa.Config.Replicas
+	peers := sa.Group.Peers
+	if d := sa.Group.Desired; d != nil && d.Group != nil {
+		peers = d.Group.Peers
+	}
+	return len(peers) < sa.Config.Replicas
 }
 
 // Called when we detect a new peer. Only the leader will process checking
@@ -2513,7 +2531,20 @@ func (js *jetStream) processAddPeer(peer string) {
 			}
 			// If we are here we can add in this peer.
 			csa := sa.copyGroup()
-			csa.Group.Peers = append(csa.Group.Peers, peer)
+			// While a move/scale is inflight, the desired peer set is the target
+			// placement, so add the new peer there; adding it to the current peer
+			// set would be undone once the in-flight desired state is promoted.
+			// Refresh the desired ID so in-flight placement updates for the old
+			// target can't promote it prematurely.
+			var targetPeers []string
+			if d := csa.Group.Desired; d != nil && d.Group != nil {
+				d.Group.Peers = append(d.Group.Peers, peer)
+				d.ID = nuid.Next()
+				targetPeers = d.Group.Peers
+			} else {
+				csa.Group.Peers = append(csa.Group.Peers, peer)
+				targetPeers = csa.Group.Peers
+			}
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
 			cc.meta.Propose(encodeAddStreamAssignment(csa))
 			cc.trackInflightStreamProposal(accName, csa, false)
@@ -2524,7 +2555,13 @@ func (js *jetStream) processAddPeer(peer string) {
 				// Ephemerals are R=1, so only auto-remap durables, or R>1.
 				if ca.Config.Durable != _EMPTY_ || len(ca.Group.Peers) > 1 {
 					cca := ca.copyGroup()
-					cca.Group.Peers = csa.Group.Peers
+					// Same as the stream above, track the target peer set.
+					if d := cca.Group.Desired; d != nil && d.Group != nil {
+						d.Group.Peers = copyStrings(targetPeers)
+						d.ID = nuid.Next()
+					} else {
+						cca.Group.Peers = copyStrings(targetPeers)
+					}
 					cc.meta.Propose(encodeAddConsumerAssignment(cca))
 					cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 				}
@@ -2581,7 +2618,9 @@ func (js *jetStream) processRemovePeer(peer string) {
 			continue
 		}
 		if rg := sa.Group; rg.isCurrentMember(peer) {
-			js.removePeerFromStreamLocked(sa, peer)
+			// The peer is being removed from the cluster entirely, so it must be
+			// evicted immediately; it can't take part in moving data.
+			js.removePeerFromStreamLocked(sa, peer, true)
 		}
 	}
 }
@@ -2590,11 +2629,19 @@ func (js *jetStream) processRemovePeer(peer string) {
 func (js *jetStream) removePeerFromStream(sa *streamAssignment, peer string) bool {
 	js.mu.Lock()
 	defer js.mu.Unlock()
-	return js.removePeerFromStreamLocked(sa, peer)
+	// The peer only leaves this stream and remains part of the cluster, so use
+	// move semantics; it can still help move data to its replacement.
+	return js.removePeerFromStreamLocked(sa, peer, false)
 }
 
+// removePeerFromStreamLocked removes a peer from a stream and remaps the stream and
+// any consumers as necessary.
+// When evict is set the peer is being removed from the cluster entirely, e.g. due
+// to a server peer-remove. It can't take part in moving data, so it's removed from
+// the current peer set immediately. Otherwise, move semantics are used and the peer
+// stays a current member until the migration to the target peer set has completed.
 // Lock should be held.
-func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string) bool {
+func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string, evict bool) bool {
 	if rg := sa.Group; !rg.isCurrentMember(peer) {
 		return false
 	}
@@ -2610,16 +2657,8 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 		s.Warnf("JetStream cluster could not replace peer for stream '%s > %s'", accName, sa.Config.Name)
 	}
 
-	// Express the remapped peer set as the desired state and keep the current
-	// peer set unchanged. The group's Raft log remains the source of truth for
-	// membership: the stream leader converges the group toward the desired set
-	// (EntryAddPeer/EntryRemovePeer) and the meta leader promotes the assignment
-	// once the actual placement matches it.
-	//
-	// Use move semantics (withDesired) to prioritize moving data safely over
-	// evicting the peer immediately: for R1 the removed peer stays preferred so
-	// it leads the transitional group until the replacement has caught up.
-	desiredGroup := csa.Group
+	// The remapped peer set is the target the group should converge to.
+	targetGroup := csa.Group
 	// Base the desired placement on any in-flight desired state so a peer-remove
 	// does not drop the placement intent of a move/scale that's underway. Without
 	// one, carry the stream's current placement so promotion keeps it unchanged.
@@ -2630,15 +2669,45 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	csa = sa.copyGroup()
 	// Remove the original reply, since this change is internal.
 	csa.Reply = _EMPTY_
-	csa.Group = sa.Group.withDesired(desiredGroup)
-	csa.Group.Desired.Placement = placement
+
+	// Whether the evicted peer held the group's only replica.
+	soleReplica := evict && len(sa.Group.Peers) == 1
+
+	if soleReplica {
+		// The evicted peer held the only replica, so there is nothing left that
+		// could move data safely. Switch the assignment to the target peer set in
+		// one go, a transitional desired state could never converge without the
+		// evicted peer.
+		csa.Group = targetGroup
+		csa.Group.Desired = nil
+		csa.Group.Preferred = _EMPTY_
+	} else {
+		// Express the remapped peer set as the desired state. The group's Raft log
+		// remains the source of truth for membership: the stream leader converges
+		// the group toward the desired set (EntryAddPeer/EntryRemovePeer) and the
+		// meta leader promotes the assignment once the actual placement matches it.
+		//
+		// With move semantics (withDesired) the removed peer stays a current member,
+		// prioritizing moving data safely over removing the peer immediately.
+		csa.Group = sa.Group.withDesired(targetGroup)
+		csa.Group.Desired.Placement = placement
+		if evict {
+			// The evicted peer can't take part in the migration, remove it from
+			// the current peer set immediately. The remaining replicas move the
+			// data to the replacement.
+			csa.Group.Peers = slices.DeleteFunc(csa.Group.Peers, func(p string) bool { return p == peer })
+			if csa.Group.Preferred == peer {
+				csa.Group.Preferred = _EMPTY_
+			}
+		}
+	}
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
 	if err := cc.meta.Propose(encodeUpdateStreamAssignment(csa)); err != nil {
 		return false
 	}
 	cc.trackInflightStreamProposal(accName, csa, false)
-	targetPeers := desiredGroup.Peers
+	targetPeers := targetGroup.Peers
 	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
 		if ca.unsupported != nil {
 			continue
@@ -2646,8 +2715,21 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 		// Ephemerals are R=1, so only auto-remap durables, or R>1.
 		if ca.Config.Durable != _EMPTY_ {
 			cca := ca.copyGroup()
-			cca.Group.Peers, cca.Group.Preferred = targetPeers, _EMPTY_
-			cca.Group = ca.Group.withDesired(cca.Group)
+			cca.Group.Peers, cca.Group.Preferred = copyStrings(targetPeers), _EMPTY_
+			if evict && len(ca.Group.Peers) == 1 && ca.Group.Peers[0] == peer {
+				// The evicted peer held the consumer's only replica, switch the
+				// assignment in one go just like the sole replica stream case.
+				cca.Group.Desired = nil
+			} else {
+				cca.Group = ca.Group.withDesired(cca.Group)
+				if evict {
+					// Evict from the consumer's current peer set immediately as well.
+					cca.Group.Peers = slices.DeleteFunc(cca.Group.Peers, func(p string) bool { return p == peer })
+					if cca.Group.Preferred == peer {
+						cca.Group.Preferred = _EMPTY_
+					}
+				}
+			}
 			if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err == nil {
 				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 			}
@@ -3901,6 +3983,23 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 
 		actual := n.PeerNames()
 		desired := sa.Group.Desired.Group.Peers
+
+		// A raft member that is neither a current nor a desired member of the group,
+		// and is no longer part of the meta group, has been evicted from the cluster,
+		// e.g. by a server peer-remove. It can't take part in this migration, so
+		// remove it from the group right away rather than waiting for the rest of
+		// the migration to complete.
+		if cc != nil && cc.meta != nil {
+			current, metaPeers := sa.Group.Peers, cc.meta.PeerNames()
+			for _, peer := range actual {
+				if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
+					js.mu.RUnlock()
+					n.ProposeRemovePeer(peer)
+					return false
+				}
+			}
+		}
+
 		foundAll := true
 		for _, peer := range desired {
 			if !slices.Contains(actual, peer) {
@@ -4093,6 +4192,23 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 
 		actual := n.PeerNames()
 		desired := ca.Group.Desired.Group.Peers
+
+		// A raft member that is neither a current nor a desired member of the group,
+		// and is no longer part of the meta group, has been evicted from the cluster,
+		// e.g. by a server peer-remove. It can't take part in this migration, so
+		// remove it from the group right away rather than waiting for the rest of
+		// the migration to complete.
+		if cc != nil && cc.meta != nil {
+			current, metaPeers := ca.Group.Peers, cc.meta.PeerNames()
+			for _, peer := range actual {
+				if !slices.Contains(current, peer) && !slices.Contains(desired, peer) && !slices.Contains(metaPeers, peer) {
+					js.mu.RUnlock()
+					n.ProposeRemovePeer(peer)
+					return false
+				}
+			}
+		}
+
 		foundAll := true
 		for _, peer := range desired {
 			if !slices.Contains(actual, peer) {
@@ -5730,7 +5846,10 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			// If we already have a stream assignment and they are the same exact config, short circuit here.
 			if osa != nil {
 				if reflect.DeepEqual(osa.Config, sa.Config) {
-					if sa.Group.Name == osa.Group.Name && reflect.DeepEqual(sa.Group.Peers, osa.Group.Peers) {
+					// The desired state must match as well: assignments can otherwise be
+					// identical while expressing a different (or refreshed) target placement,
+					// which the running stream needs to pick up to drive the migration.
+					if sa.Group.Name == osa.Group.Name && reflect.DeepEqual(sa.Group.Peers, osa.Group.Peers) && sa.Group.sameDesired(osa.Group) {
 						// Since this already exists we know it succeeded, just respond to this caller.
 						js.mu.RLock()
 						client, subject, reply, recovering := sa.Client, sa.Subject, sa.Reply, sa.recovering
