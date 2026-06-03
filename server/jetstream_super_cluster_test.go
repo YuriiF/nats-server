@@ -3741,6 +3741,257 @@ func TestJetStreamSuperClusterDoubleStreamMove(t *testing.T) {
 	moveAndCheck(srvMoveList[3], srvMoveList[0], srvMoveList[2], srvMoveList[1], srvMoveList[0])
 }
 
+// TestJetStreamSuperClusterStreamPeerRemoveDuringMove checks that a stream peer-remove
+// issued while a cross-cluster move is in flight operates on the desired peer set when
+// one is present, and otherwise on the current peer set:
+//  1. Removing a peer that is only in the current set must not reset the move's target:
+//     the desired peer set must keep pointing at the target cluster.
+//  2. Removing a peer that is only in the desired set must be accepted (membership is
+//     evaluated against the desired set) and remapped within the target cluster, so a
+//     move that is stuck on a dead target peer can be unstuck.
+func TestJetStreamSuperClusterStreamPeerRemoveDuringMove(t *testing.T) {
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
+		func(serverName, clusterName, storeDir, conf string) string {
+			return fmt.Sprintf("%s\nserver_tags: [cluster:%s]", conf, clusterName)
+		}, nil)
+	defer sc.shutdown()
+
+	c1, c2 := sc.clusterForName("C1"), sc.clusterForName("C2")
+
+	// Map peer IDs to server names per cluster.
+	c1Peers, c2Peers := map[string]string{}, map[string]string{}
+	for _, s := range c1.servers {
+		c1Peers[getHash(s.Name())] = s.Name()
+	}
+	for _, s := range c2.servers {
+		c2Peers[getHash(s.Name())] = s.Name()
+	}
+
+	nc, js := jsClientConnect(t, c1.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Replicas:  3,
+		Placement: &nats.Placement{Tags: []string{"cluster:C1"}},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "DUR", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	// Publish enough data that moving the stream between clusters takes a while.
+	payload := []byte(strings.Repeat("Z", 1024))
+	toSend := 2_000
+	for range toSend {
+		_, err = js.Publish("foo", payload)
+		require_NoError(t, err)
+	}
+
+	// Inspect stream assignments on the meta leader.
+	sc.waitOnLeader()
+	ml := sc.leader()
+	require_NotNil(t, ml)
+
+	type placementState struct {
+		current   []string
+		desired   []string
+		placement *Placement
+	}
+	streamState := func() placementState {
+		t.Helper()
+		mjs := ml.getJetStream()
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		sa := mjs.streamAssignment(globalAccountName, "TEST")
+		require_NotNil(t, sa)
+		st := placementState{current: copyStrings(sa.Group.Peers)}
+		if d := sa.Group.Desired; d != nil {
+			st.placement = d.Placement
+			if d.Group != nil {
+				st.desired = copyStrings(d.Group.Peers)
+			}
+		}
+		return st
+	}
+	requireAllInCluster := func(peers []string, clusterPeers map[string]string, cluster string) {
+		t.Helper()
+		for _, p := range peers {
+			if _, ok := clusterPeers[p]; !ok {
+				t.Fatalf("Expected peer %q to be a %s server, got peers %+v", p, cluster, peers)
+			}
+		}
+	}
+
+	// Before the move: R3, all peers in C1, no desired state.
+	st := streamState()
+	require_Len(t, len(st.current), 3)
+	requireAllInCluster(st.current, c1Peers, "C1")
+	require_True(t, st.desired == nil)
+
+	// Initiate the move to C2.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Replicas:  3,
+		Placement: &nats.Placement{Tags: []string{"cluster:C2"}},
+	})
+	require_NoError(t, err)
+
+	// The move expresses its target as desired state: all desired peers in C2.
+	st = streamState()
+	require_Len(t, len(st.desired), 3)
+	requireAllInCluster(st.desired, c2Peers, "C2")
+
+	// Stall the move by stopping one of the desired C2 peers (not the meta leader, so meta
+	// leadership stays put). The migration cannot converge until that peer is replaced.
+	var downPeer, downServer string
+	for _, p := range st.desired {
+		if name := c2Peers[p]; name != ml.Name() {
+			downPeer, downServer = p, name
+			break
+		}
+	}
+	require_NotEqual(t, downServer, _EMPTY_)
+	c2.serverByName(downServer).Shutdown()
+
+	// The move must still be in flight, still targeting the same C2 peers. If this fails,
+	// the move completed before we could stall it and the test setup needs more data.
+	st = streamState()
+	require_Len(t, len(st.desired), 3)
+	requireAllInCluster(st.desired, c2Peers, "C2")
+	require_True(t, slices.Contains(st.desired, downPeer))
+
+	removePeer := func(name string) *JSApiStreamRemovePeerResponse {
+		t.Helper()
+		req, err := json.Marshal(&JSApiStreamRemovePeerRequest{Peer: name})
+		require_NoError(t, err)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), req, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiStreamRemovePeerResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		return &resp
+	}
+
+	// Case 1: peer-remove a current (C1) member while the move is in flight. The peer
+	// already leaves the group once the move completes, so this must be accepted, and it
+	// must not reset the move's target back to peers based on the current (C1) set.
+	sc.waitOnStreamLeader(globalAccountName, "TEST")
+	sl := c1.streamLeader(globalAccountName, "TEST")
+	require_NotNil(t, sl)
+	var rmName string
+	for _, p := range st.current {
+		if name := c1Peers[p]; name != sl.Name() {
+			rmName = name
+			break
+		}
+	}
+	require_NotEqual(t, rmName, _EMPTY_)
+
+	resp := removePeer(rmName)
+	require_True(t, resp.Error == nil)
+	require_True(t, resp.Success)
+
+	// The success response is sent when the change is proposed, not when it is applied.
+	// Give any (re)proposed assignments time to commit, then check the move target survived.
+	time.Sleep(2 * time.Second)
+	st = streamState()
+	if len(st.desired) != 3 {
+		t.Fatalf("Expected the move to still be in flight with 3 desired peers, got %+v", st.desired)
+	}
+	requireAllInCluster(st.desired, c2Peers, "C2")
+	require_NotNil(t, st.placement)
+	require_True(t, slices.Contains(st.placement.Tags, "cluster:C2"))
+
+	// Case 2: peer-remove the stopped C2 peer. It is only a member of the desired set, not
+	// of the current set, so membership must be evaluated against the desired set. This
+	// replaces the dead target peer and lets the stuck move complete.
+	st = streamState()
+	require_True(t, slices.Contains(st.desired, downPeer))
+	resp = removePeer(downServer)
+	if resp.Error != nil {
+		t.Fatalf("Expected peer-remove of desired-set peer %q to succeed, got %+v", downServer, resp.Error)
+	}
+	require_True(t, resp.Success)
+
+	// The desired set must be remapped within C2, replacing the stopped peer.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		st := streamState()
+		if len(st.desired) != 3 {
+			return fmt.Errorf("expected 3 desired peers, got %+v", st.desired)
+		}
+		for _, p := range st.desired {
+			if p == downPeer {
+				return fmt.Errorf("removed peer %q still in desired set", downServer)
+			}
+			if _, ok := c2Peers[p]; !ok {
+				return fmt.Errorf("desired peer %q not in target cluster C2", p)
+			}
+		}
+		return nil
+	})
+
+	// With the dead peer replaced, the move must now be able to complete: stream and
+	// consumer end up in C2, with all data, and without the removed/stopped servers.
+	checkFor(t, 60*time.Second, 250*time.Millisecond, func() error {
+		si, err := streamInfo(t, nc, "TEST")
+		if err != nil {
+			return fmt.Errorf("could not fetch stream info: %v", err)
+		}
+		if si.Cluster.Desired != nil {
+			return fmt.Errorf("stream is still moving")
+		}
+		if si.Cluster.Name != "C2" {
+			return fmt.Errorf("expected cluster C2, got %q", si.Cluster.Name)
+		}
+		if si.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("no leader yet")
+		}
+		peers := []string{si.Cluster.Leader}
+		for _, r := range si.Cluster.Replicas {
+			peers = append(peers, r.Name)
+		}
+		if len(peers) != 3 {
+			return fmt.Errorf("expected 3 peers, got %+v", peers)
+		}
+		for _, name := range peers {
+			if name == downServer {
+				return fmt.Errorf("removed peer %q still hosting the stream", downServer)
+			}
+			if _, ok := c2Peers[getHash(name)]; !ok {
+				return fmt.Errorf("peer %q not in cluster C2", name)
+			}
+		}
+		if si.State.Msgs != uint64(toSend) {
+			return fmt.Errorf("expected %d msgs, got %d", toSend, si.State.Msgs)
+		}
+
+		// Consumer must have moved along with the stream.
+		ci, err := consumerInfo(t, nc, "TEST", "DUR")
+		if err != nil {
+			return fmt.Errorf("could not fetch consumer info: %v", err)
+		}
+		if ci.Cluster.Desired != nil {
+			return fmt.Errorf("consumer is still moving")
+		}
+		if ci.Cluster.Name != "C2" {
+			return fmt.Errorf("expected consumer on cluster C2, got %q", ci.Cluster.Name)
+		}
+		if ci.NumPending != uint64(toSend) {
+			return fmt.Errorf("expected %d pending, got %d", toSend, ci.NumPending)
+		}
+		return nil
+	})
+
+	// And the consumer must be able to deliver the moved data.
+	pullSub, err := js.PullSubscribe("foo", "DUR")
+	require_NoError(t, err)
+	msgs, err := pullSub.Fetch(100, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 100)
+}
+
 func TestJetStreamSuperClusterPeerEvacuationAndStreamReassignment(t *testing.T) {
 	s := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
 		func(serverName, clusterName, storeDir, conf string) string {

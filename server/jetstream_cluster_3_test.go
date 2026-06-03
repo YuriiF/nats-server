@@ -1993,7 +1993,10 @@ func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 
 		sc.waitOnStreamLeader(globalAccountName, "TEST")
 
-		checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		// Peer-remove uses move semantics: the group transitionally expands with the
+		// replacement peer before the removed peer is evicted and the assignment is
+		// promoted, so allow enough time for that migration to complete.
+		checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 			osi, err = jsc.StreamInfo("TEST")
 			require_NoError(t, err)
 			if len(osi.Cluster.Replicas) != 2 {

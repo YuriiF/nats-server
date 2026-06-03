@@ -2617,7 +2617,7 @@ func (js *jetStream) processRemovePeer(peer string) {
 		if sa.unsupported != nil {
 			continue
 		}
-		if rg := sa.Group; rg.isCurrentMember(peer) {
+		if rg := sa.Group; rg.isMember(peer) {
 			// The peer is being removed from the cluster entirely, so it must be
 			// evicted immediately; it can't take part in moving data.
 			js.removePeerFromStreamLocked(sa, peer, true)
@@ -2642,30 +2642,43 @@ func (js *jetStream) removePeerFromStream(sa *streamAssignment, peer string) boo
 // stays a current member until the migration to the target peer set has completed.
 // Lock should be held.
 func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string, evict bool) bool {
-	if rg := sa.Group; !rg.isCurrentMember(peer) {
+	// Membership is desired-aware, so a peer that is only part of an inflight
+	// move/scale target can be removed as well.
+	if rg := sa.Group; !rg.isMember(peer) {
 		return false
 	}
 
-	s, cc, csa := js.srv, js.cluster, sa.copyGroup()
+	s, cc := js.srv, js.cluster
 	if cc == nil || cc.meta == nil {
 		return false
 	}
-	// Compute the target peer set on a scratch copy of the group.
-	replaced := cc.remapStreamAssignment(csa, peer)
 	accName := sa.Client.serviceAccount()
+
+	// Base the remap on where the group is headed, not necessarily where it currently
+	// is: an in-flight desired state (move/scale underway) takes precedence over the
+	// current peer set and placement, so a peer-remove does not drop the placement
+	// intent of a move/scale that's underway. Without one, use the current peer set
+	// and carry the stream's current placement so promotion keeps it unchanged.
+	basePeers, placement := sa.Group.targetPeers(), sa.effectivePlacement()
+
+	// If the peer is a current member but no longer part of the inflight desired
+	// state, that move/scale already removes it. Nothing to remap, report success
+	// and let the inflight change complete.
+	if !slices.Contains(basePeers, peer) {
+		return true
+	}
+
+	// Compute the new target peer set on a scratch copy of the group. The remap is
+	// desired-aware: it replaces the peer in the peer set the group is converging
+	// toward, honoring the effective placement.
+	csa := sa.copyGroup()
+	replaced := cc.remapStreamAssignment(csa, peer)
 	if !replaced {
 		s.Warnf("JetStream cluster could not replace peer for stream '%s > %s'", accName, sa.Config.Name)
 	}
 
 	// The remapped peer set is the target the group should converge to.
 	targetGroup := csa.Group
-	// Base the desired placement on any in-flight desired state so a peer-remove
-	// does not drop the placement intent of a move/scale that's underway. Without
-	// one, carry the stream's current placement so promotion keeps it unchanged.
-	placement := sa.Config.Placement
-	if d := sa.Group.Desired; d != nil {
-		placement = d.Placement
-	}
 	csa = sa.copyGroup()
 	// Remove the original reply, since this change is internal.
 	csa.Reply = _EMPTY_
@@ -2948,6 +2961,24 @@ func (rg *raftGroup) isCurrentMember(id string) bool {
 		}
 	}
 	return false
+}
+
+// targetPeers returns the peer set the group is converging toward: the desired peer
+// set while a move/scale is inflight, otherwise the current peers.
+func (rg *raftGroup) targetPeers() []string {
+	if d := rg.Desired; d != nil && d.Group != nil {
+		return d.Group.Peers
+	}
+	return rg.Peers
+}
+
+// effectivePlacement returns the placement the stream's group is converging toward:
+// the desired placement while a move/scale is inflight, otherwise the configured placement.
+func (sa *streamAssignment) effectivePlacement() *Placement {
+	if d := sa.Group.Desired; d != nil {
+		return d.Placement
+	}
+	return sa.Config.Placement
 }
 
 // combinePeersWithDesired returns the union of rg's current peers and, while a
@@ -8128,11 +8159,18 @@ func (js *jetStream) processLeaderChange(isLeader bool) {
 	}
 }
 
+// remapStreamAssignment replaces removePeer in the group's target peer set with a newly
+// selected peer, and stores the result in sa.Group.Peers. The remap is desired-aware: while
+// a move/scale is inflight it operates on the desired peer set and honors the desired
+// placement, which can live in a different cluster than the stream's current group.
+// Otherwise it operates on the current peer set and the configured placement.
 // Lock should be held.
 func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePeer string) bool {
+	targetPeers, placement := sa.Group.targetPeers(), sa.effectivePlacement()
+
 	// Invoke placement algo passing RG peers that stay (existing) and the peer that is being removed (ignore)
 	var retain, ignore []string
-	for _, v := range sa.Group.Peers {
+	for _, v := range targetPeers {
 		if v == removePeer {
 			ignore = append(ignore, v)
 		} else {
@@ -8140,7 +8178,22 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 		}
 	}
 
-	newPeers, placementError := cc.selectPeerGroup(len(sa.Group.Peers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
+	// Select the replacement using the effective placement, and from the cluster the
+	// target peer set actually lives in. Both can differ from the stream's current
+	// config placement and group cluster while a cross-cluster move is inflight.
+	cfg := *sa.Config
+	cfg.Placement = placement
+	cluster := sa.Group.Cluster
+	if placement != nil && placement.Cluster != _EMPTY_ {
+		// An explicitly placed cluster is authoritative.
+		cluster = placement.Cluster
+	} else if cl := cc.clusterForPeers(retain); cl != _EMPTY_ {
+		cluster = cl
+	} else if cl := cc.clusterForPeers(ignore); cl != _EMPTY_ {
+		cluster = cl
+	}
+
+	newPeers, placementError := cc.selectPeerGroup(len(targetPeers), cluster, &cfg, retain, 0, ignore)
 
 	if placementError == nil {
 		sa.Group.Peers = newPeers
@@ -8150,19 +8203,28 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 	}
 
 	// If R1 just return to avoid bricking the stream.
-	if sa.Group.node == nil || len(sa.Group.Peers) == 1 {
+	if sa.Group.node == nil || len(targetPeers) == 1 {
+		sa.Group.Peers = copyStrings(targetPeers)
 		return false
 	}
 
-	// If we are here let's remove the peer at least, as long as we are R>1
-	for i, peer := range sa.Group.Peers {
-		if peer == removePeer {
-			sa.Group.Peers[i] = sa.Group.Peers[len(sa.Group.Peers)-1]
-			sa.Group.Peers = sa.Group.Peers[:len(sa.Group.Peers)-1]
-			break
+	// If we are here let's remove the peer at least, as long as we are R>1.
+	// The retained peers are exactly the target peer set minus the removed peer.
+	sa.Group.Peers = retain
+	return false
+}
+
+// clusterForPeers returns the name of the cluster the given peers are placed in, based
+// on the first peer with known node information. Returns empty if unknown.
+func (cc *jetStreamCluster) clusterForPeers(peers []string) string {
+	for _, p := range peers {
+		if si, ok := cc.s.nodeToInfo.Load(p); ok && si != nil {
+			if cl := si.(nodeInfo).cluster; cl != _EMPTY_ {
+				return cl
+			}
 		}
 	}
-	return false
+	return _EMPTY_
 }
 
 type selectPeerError struct {
@@ -8985,10 +9047,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, osa.Config.Name) {
 			// The consumer's target peer set. If the consumer itself has a scale or move
 			// inflight, we must remap against where it is headed, not where it currently is.
-			targetPeers := ca.Group.Peers
-			if d := ca.Group.Desired; d != nil && d.Group != nil {
-				targetPeers = d.Group.Peers
-			}
+			targetPeers := ca.Group.targetPeers()
 			// Legacy ephemerals are R=1 but present as R=0, so only auto-remap named consumers, or if we are downsizing the consumer peers.
 			// If stream is interest or workqueue policy always remaps since they require peer parity with stream.
 			numPeers := len(targetPeers)

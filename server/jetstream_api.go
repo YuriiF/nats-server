@@ -2408,10 +2408,10 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, _ *Acco
 	// Check to see if we are a member of the group.
 	// Peer here is either a peer ID or a server name, convert to node name.
 	nodeName := getHash(req.Peer)
-	isMember := rg.isCurrentMember(nodeName)
+	isMember := rg.isMember(nodeName)
 	if !isMember {
 		nodeName = req.Peer
-		isMember = rg.isCurrentMember(nodeName)
+		isMember = rg.isMember(nodeName)
 	}
 	js.mu.RUnlock()
 
