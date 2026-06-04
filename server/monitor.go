@@ -1298,6 +1298,7 @@ type Varz struct {
 	StaleConnectionStats  *StaleConnectionStats  `json:"stale_connection_stats,omitempty"`  // StaleConnectionStats are statistics about all detected Stale Connections
 	Proxies               *ProxiesOptsVarz       `json:"proxies,omitempty"`                 // Proxies hold information about network proxy devices
 	TLSCertNotAfter       time.Time              `json:"tls_cert_not_after,omitzero"`       // TLSCertNotAfter is the expiration date of the TLS certificate of this server
+	IOWaiters             int64                  `json:"io_waiters"`                        // IOWaiters is the number of goroutines waiting on the disk I/O semaphore
 }
 
 // JetStreamVarz contains basic runtime information about jetstream
@@ -1968,6 +1969,14 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 			}
 		}
 	}
+	v.IOWaiters = diskIOWaiters(s.dios)
+}
+
+func diskIOWaiters(d *diskIOSemaphore) int64 {
+	if d == nil {
+		return 0
+	}
+	return d.waiters.Load()
 }
 
 // HandleVarz will process HTTP requests for server information.
