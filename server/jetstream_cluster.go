@@ -1011,12 +1011,13 @@ func (js *jetStream) setupMetaGroup() error {
 	syncAlways := js.srv.opts.SyncAlways
 	syncInterval := js.srv.opts.SyncInterval
 	js.srv.optsMu.RUnlock()
-	fs, err := newFileStoreWithCreated(
+	fs, err := newFileStoreWithCreatedAndDios(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMetaFSBlkSize, AsyncFlush: false, SyncAlways: syncAlways, SyncInterval: syncInterval, srv: s},
 		StreamConfig{Name: defaultMetaGroupName, Storage: FileStorage},
 		time.Now().UTC(),
 		s.jsKeyGen(s.getOpts().JetStreamKey, defaultMetaGroupName),
 		s.jsKeyGen(s.getOpts().JetStreamOldKey, defaultMetaGroupName),
+		s.raftDiskIOSemaphore(),
 	)
 	if err != nil {
 		s.Errorf("Error creating filestore: %v", err)
@@ -1030,7 +1031,7 @@ func (js *jetStream) setupMetaGroup() error {
 	cfg.Observer = s.canExtendOtherDomain() && s.getOpts().JetStreamExtHint != jsNoExtend
 
 	var bootstrap bool
-	if ps, err := readPeerState(s.diskIOSemaphore(), storeDir); err != nil {
+	if ps, err := readPeerState(s.raftDiskIOSemaphore(), storeDir); err != nil {
 		s.Noticef("JetStream cluster bootstrapping")
 		bootstrap = true
 		peers := s.ActivePeers()
@@ -1064,7 +1065,7 @@ func (js *jetStream) setupMetaGroup() error {
 			// To track possible configuration changes, responsible for an altered value of cfg.Observer,
 			// set extension state to undetermined.
 			ps.domainExt = extUndetermined
-			if err := writePeerState(s.diskIOSemaphore(), storeDir, ps); err != nil {
+			if err := writePeerState(s.raftDiskIOSemaphore(), storeDir, ps); err != nil {
 				return err
 			}
 		}
@@ -2910,12 +2911,13 @@ retry:
 		var store StreamStore
 		if storage == FileStorage {
 			opts := s.getOpts()
-			fs, err := newFileStoreWithCreated(
+			fs, err := newFileStoreWithCreatedAndDios(
 				FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, SyncAlways: opts.SyncAlways, SyncInterval: opts.SyncInterval, srv: s},
 				StreamConfig{Name: rgName, Storage: FileStorage, Metadata: labels},
 				time.Now().UTC(),
 				s.jsKeyGen(opts.JetStreamKey, rgName),
 				s.jsKeyGen(opts.JetStreamOldKey, rgName),
+				s.raftDiskIOSemaphore(),
 			)
 			if err != nil {
 				s.Errorf("Error creating filestore WAL: %v", err)
@@ -2933,7 +2935,7 @@ retry:
 
 		cfg := &RaftConfig{Name: rgName, Store: storeDir, Log: store, Track: true, Recovering: recovering, ScaleUp: rgScaleUp}
 
-		if _, err := readPeerState(s.diskIOSemaphore(), storeDir); err != nil {
+		if _, err := readPeerState(s.raftDiskIOSemaphore(), storeDir); err != nil {
 			s.bootstrapRaftNode(cfg, rgPeers, true)
 		}
 

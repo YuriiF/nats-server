@@ -1299,6 +1299,7 @@ type Varz struct {
 	Proxies               *ProxiesOptsVarz       `json:"proxies,omitempty"`                 // Proxies hold information about network proxy devices
 	TLSCertNotAfter       time.Time              `json:"tls_cert_not_after,omitzero"`       // TLSCertNotAfter is the expiration date of the TLS certificate of this server
 	IOWaiters             int64                  `json:"io_waiters"`                        // IOWaiters is the number of goroutines waiting on the disk I/O semaphore
+	RaftIOWaiters         int64                  `json:"raft_io_waiters"`                   // RaftIOWaiters is the number of goroutines waiting on the raft disk I/O semaphore
 }
 
 // JetStreamVarz contains basic runtime information about jetstream
@@ -1970,6 +1971,7 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 		}
 	}
 	v.IOWaiters = diskIOWaiters(s.dios)
+	v.RaftIOWaiters = diskIOWaiters(s.raftDios)
 }
 
 func diskIOWaiters(d *diskIOSemaphore) int64 {

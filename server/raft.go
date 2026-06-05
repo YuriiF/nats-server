@@ -408,13 +408,13 @@ func (s *Server) bootstrapRaftNode(cfg *RaftConfig, knownPeers []string, allPeer
 	tmpfile.Close()
 	os.Remove(tmpfile.Name())
 
-	return writePeerState(s.diskIOSemaphore(), cfg.Store, &peerState{knownPeers, expected, extUndetermined})
+	return writePeerState(s.raftDiskIOSemaphore(), cfg.Store, &peerState{knownPeers, expected, extUndetermined})
 }
 
 // initRaftNode will initialize the raft node, to be used by startRaftNode or when testing to not run the Go routine.
 func (s *Server) initRaftNode(accName string, cfg *RaftConfig, labels pprofLabels) (*raft, error) {
 	restorePeerState := func(n *raft) error {
-		ps, err := readPeerState(s.diskIOSemaphore(), cfg.Store)
+		ps, err := readPeerState(s.raftDiskIOSemaphore(), cfg.Store)
 		if err != nil {
 			return err
 		}
@@ -445,7 +445,7 @@ func (s *Server) initRaftNode(accName string, cfg *RaftConfig, labels pprofLabel
 		sd:       cfg.Store,
 		wal:      cfg.Log,
 		wtype:    cfg.Log.Type(),
-		dios:     s.diskIOSemaphore(),
+		dios:     s.raftDiskIOSemaphore(),
 		track:    cfg.Track,
 		peers:    make(map[string]*lps),
 		acks:     make(map[uint64]map[string]struct{}),

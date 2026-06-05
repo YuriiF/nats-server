@@ -42,7 +42,7 @@ func benchmarkWriteTermVote(b *testing.B, workers int) {
 		wtvs[i] = wtv
 	}
 
-	dios := defaultDiskIOSemaphore()
+	dios := raftDiskIOSemaphore()
 	var next atomic.Uint64
 	var wg sync.WaitGroup
 	type latencyStats struct {

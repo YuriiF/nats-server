@@ -45,6 +45,16 @@ func defaultDiskIOSemaphore() *diskIOSemaphore {
 	return newDiskIOSemaphore(nIO)
 }
 
+func raftDiskIOSemaphore() *diskIOSemaphore {
+	// During election storms, Raft groups will issue a large
+	// number of concurrent fsyncs.
+	// A limit based on the number CPU cores makes poor use of
+	// devices that can handle requests in parallel, and can
+	// slow down elections, or cause them to time out, which
+	// would require even more I/O.
+	return newDiskIOSemaphore(512)
+}
+
 func (d *diskIOSemaphore) acquire() {
 	select {
 	case <-d.ch:

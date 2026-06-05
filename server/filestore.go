@@ -389,6 +389,10 @@ func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
 }
 
 func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created time.Time, prf, oldprf keyGen) (fs *fileStore, err error) {
+	return newFileStoreWithCreatedAndDios(fcfg, cfg, created, prf, oldprf, nil)
+}
+
+func newFileStoreWithCreatedAndDios(fcfg FileStoreConfig, cfg StreamConfig, created time.Time, prf, oldprf keyGen, dios *diskIOSemaphore) (fs *fileStore, err error) {
 	if cfg.Name == _EMPTY_ {
 		return nil, fmt.Errorf("name required")
 	}
@@ -411,7 +415,9 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	if fcfg.SyncInterval == 0 {
 		fcfg.SyncInterval = defaultSyncInterval
 	}
-	dios := fcfg.srv.diskIOSemaphore()
+	if dios == nil {
+		dios = fcfg.srv.diskIOSemaphore()
+	}
 
 	// Check the directory
 	if stat, err := os.Stat(fcfg.StoreDir); os.IsNotExist(err) {
