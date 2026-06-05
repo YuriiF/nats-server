@@ -181,6 +181,7 @@ type raft struct {
 	pae     map[uint64]*appendEntry        // Pending append entries
 
 	elect  *time.Timer // Election timer, normally accessed via electTimer
+	etbo   int         // Election timer backoff after repeated candidacy attempts
 	etlr   time.Time   // Election timer last reset time, for unit tests only
 	active time.Time   // Last activity time, i.e. for heartbeats
 	llqrt  time.Time   // Last quorum lost time
@@ -282,6 +283,7 @@ type lps struct {
 const (
 	minElectionTimeoutDefault      = 4 * time.Second
 	maxElectionTimeoutDefault      = 9 * time.Second
+	maxElectionTimeoutBackoff      = 4
 	minCampaignTimeoutDefault      = 100 * time.Millisecond
 	maxCampaignTimeoutDefault      = 8 * minCampaignTimeoutDefault
 	hbIntervalDefault              = 1 * time.Second
@@ -2378,11 +2380,17 @@ func randElectionTimeout() time.Duration {
 
 // Lock should be held.
 func (n *raft) resetElectionTimeout() {
-	n.resetElect(randElectionTimeout())
+	timeout := randElectionTimeout()
+	if n.State() == Candidate {
+		timeout *= time.Duration(max(1, n.etbo))
+	}
+	n.resetElect(timeout)
 }
 
 func (n *raft) resetElectionTimeoutWithLock() {
-	n.resetElectWithLock(randElectionTimeout())
+	n.Lock()
+	defer n.Unlock()
+	n.resetElectionTimeout()
 }
 
 // Lock should be held.
@@ -5309,12 +5317,15 @@ func (n *raft) switchToCandidate() {
 
 	if n.State() != Candidate {
 		n.debug("Switching to candidate")
+		n.etbo = 1
 	} else {
 		if n.lostQuorumLocked() && time.Since(n.llqrt) > 20*time.Second {
 			// We signal to the upper layers such that can alert on quorum lost.
 			n.updateLeadChange(false)
 			n.llqrt = time.Now()
 		}
+		// Back off repeated candidate retries until we leave candidate state.
+		n.etbo = min(n.etbo+1, maxElectionTimeoutBackoff)
 	}
 	// Increment the term.
 	n.term++

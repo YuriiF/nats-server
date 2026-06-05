@@ -657,6 +657,21 @@ func TestNRGUnsuccessfulVoteRequestCampaignEarly(t *testing.T) {
 	require_Equal(t, n.etlr, time.Time{})
 }
 
+func TestNRGElectionTimerBackoff(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	for i := 1; i <= maxElectionTimeoutBackoff+1; i++ {
+		n.switchToCandidate()
+		backoff := min(i, maxElectionTimeoutBackoff)
+		require_Equal(t, n.etbo, backoff)
+	}
+
+	n.switchToFollower(noLeader)
+	n.switchToCandidate()
+	require_Equal(t, n.etbo, 1)
+}
+
 func TestNRGInvalidTAVDoesntPanic(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
