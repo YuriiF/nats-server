@@ -226,6 +226,14 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			return
 		}
 	}
+
+	// End of backup sentinel. A clear marker makes it obvious when
+	// a backup has been truncated or not without having to count
+	// messages or from first/last sequence, which may not be possible
+	// during the rewrite of a large stream backup.
+	if err = writeGeneric(_EMPTY_, 0, 0, 0, 0, nil); err != nil {
+		errCh <- err.Error()
+	}
 }
 
 // RestoreStreamSnapshotV2 will restore a stream from a snapshot.
@@ -339,13 +347,19 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 
 	store := mset.store
 	lseq := nstate.FirstSeq - 1
-	for range nstate.Msgs {
+	eob := false
+	for {
 		hdr, err := tr.Next()
 		if err != nil {
 			return nil, err
 		}
 		seq := hdr.Sequence
 		if seq == 0 {
+			// Sentinel "end of backup" if all fields are zero.
+			if hdr.Timestamp == 0 && hdr.HeaderSize == 0 && hdr.PayloadSize == 0 {
+				eob = true
+				break
+			}
 			return nil, fmt.Errorf("expected message sequence")
 		}
 		if hdr.HeaderSize < 0 || hdr.PayloadSize < 0 {
@@ -401,9 +415,8 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		}
 	}
 
-	if _, err := tr.Next(); err != io.EOF {
-		return nil, fmt.Errorf("unexpected trailing entries")
+	if !eob {
+		return mset, fmt.Errorf("backup was truncated")
 	}
-
 	return mset, nil
 }
